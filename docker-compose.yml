@@ -1,0 +1,195 @@
+services:
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+      - "7071:7071"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_JMX_PORT: 7071
+      KAFKA_JMX_HOSTNAME: kafka
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:9092
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "kafka:9092"
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: "_schemas"
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: "BACKWARD"
+    healthcheck:
+      test: curl -f http://localhost:8081/subjects || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kafka-connect:
+    image: debezium/connect:2.6
+    hostname: kafka-connect
+    container_name: kafka-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:9092"
+      GROUP_ID: "kafka-connect-cluster"
+      CONFIG_STORAGE_TOPIC: "_connect-configs"
+      OFFSET_STORAGE_TOPIC: "_connect-offsets"
+      STATUS_STORAGE_TOPIC: "_connect-status"
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # KEY_CONVERTER: "io.confluent.connect.avro.AvroConverter"
+      # VALUE_CONVERTER: "io.confluent.connect.avro.AvroConverter"
+      # KEY_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      # VALUE_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      # REPLACE with these 4 lines
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      #
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_PLUGIN_PATH: "/kafka/connect,/usr/share/confluent-hub-components"
+    volumes:
+      - ./connectors:/kafka/connect/custom
+    healthcheck:
+      test: curl -f http://localhost:8083/ || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+      - schema-registry
+      - kafka-connect
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-source
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: sourcedb
+      MYSQL_USER: kafka_user
+      MYSQL_PASSWORD: kafka_password
+    command: >
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+      --server-id=1
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./scripts/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  postgres:
+    image: postgres:16
+    container_name: postgres-target
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: targetdb
+      POSTGRES_USER: kafka_user
+      POSTGRES_PASSWORD: kafka_password
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    command:
+      - "--kafka.server=kafka:9092"
+      - "--web.listen-address=:9308"
+      - "--topic.filter=.*"
+      - "--group.filter=.*"
+    ports:
+      - "9308:9308"
+    depends_on:
+      - kafka
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+
+volumes:
+  kafka-data:
+  mysql-data:
+  postgres-data:
+  grafana-data:
+
+  

@@ -256,10 +256,10 @@ services:
       CONFIG_STORAGE_REPLICATION_FACTOR: 1
       OFFSET_STORAGE_REPLICATION_FACTOR: 1
       STATUS_STORAGE_REPLICATION_FACTOR: 1
-      KEY_CONVERTER: "io.confluent.connect.avro.AvroConverter"
-      VALUE_CONVERTER: "io.confluent.connect.avro.AvroConverter"
-      KEY_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
-      VALUE_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
       CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
       CONNECT_PLUGIN_PATH: "/kafka/connect,/usr/share/confluent-hub-components"
     volumes:
@@ -481,6 +481,22 @@ scrape_configs:
 ## Step 2.5 — Start all services
 
 Run from inside the `kafka-pipeline/` directory:
+
+- **Pull images one by one (more stable on slow connections)**
+
+```
+docker pull confluentinc/cp-kafka:7.6.1
+docker pull confluentinc/cp-schema-registry:7.6.1
+docker pull debezium/connect:2.6
+docker pull provectuslabs/kafka-ui:latest
+docker pull mysql:8.0
+docker pull postgres:16
+docker pull danielqsj/kafka-exporter:latest
+docker pull prom/prometheus:latest
+docker pull grafana/grafana:latest
+```
+
+- **Then run docker compose up -d after all pulls complete.**
 
 ```powershell
 docker compose up -d
@@ -721,10 +737,10 @@ Key decisions in this config:
     "snapshot.mode": "initial",
     "snapshot.locking.mode": "minimal",
 
-    "key.converter": "io.confluent.connect.avro.AvroConverter",
-    "key.converter.schema.registry.url": "http://schema-registry:8081",
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
 
     "transforms": "unwrap,addMetadata",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
@@ -900,10 +916,10 @@ Key decisions:
 
     "table.name.format": "pipeline.${topic}",
 
-    "key.converter": "io.confluent.connect.avro.AvroConverter",
-    "key.converter.schema.registry.url": "http://schema-registry:8081",
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
 
     "transforms": "dropMetaFields",
     "transforms.dropMetaFields.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
