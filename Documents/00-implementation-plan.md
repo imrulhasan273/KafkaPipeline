@@ -773,10 +773,17 @@ Key decisions in this config:
 ## Step 4.2 — Register the source connector
 
 ```powershell
-# Register via REST API
-curl -X POST http://localhost:8083/connectors `
+# Option 1: curl.exe (recommended in PowerShell — @ reads directly from file)
+curl.exe -X POST http://localhost:8083/connectors `
   -H "Content-Type: application/json" `
   -d "@connectors/source/mysql-cdc-source.json"
+
+# Option 2: Invoke-RestMethod (native PowerShell)
+$body = Get-Content connectors/source/mysql-cdc-source.json -Raw
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8083/connectors" `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
 Git Bash version:
@@ -945,9 +952,17 @@ Key decisions:
 ## Step 5.2 — Register the sink connector
 
 ```powershell
-curl -X POST http://localhost:8083/connectors `
+# Option 1: curl.exe (recommended in PowerShell)
+curl.exe -X POST http://localhost:8083/connectors `
   -H "Content-Type: application/json" `
   -d "@connectors/sink/postgres-sink.json"
+
+# Option 2: Invoke-RestMethod (native PowerShell)
+$body = Get-Content connectors/sink/postgres-sink.json -Raw
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8083/connectors" `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
 Git Bash:

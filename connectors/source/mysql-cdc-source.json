@@ -1,0 +1,52 @@
+{
+  "name": "mysql-cdc-source",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "tasks.max": "1",
+
+    
+    "database.hostname": "mysql",
+    "database.port": "3306",
+    "database.user": "kafka_user",
+    "database.password": "kafka_password",
+    "database.server.id": "184054",
+    "database.server.name": "prod.mysql",
+
+    "topic.prefix": "prod.mysql",
+    "database.include.list": "sourcedb",
+    "table.include.list": "sourcedb.orders,sourcedb.customers",
+
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "_schema-changes.mysql",
+
+    "include.schema.changes": "true",
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "minimal",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    "transforms": "unwrap,addMetadata",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.add.fields": "op,ts_ms,source.db,source.table",
+    "transforms.unwrap.delete.handling.mode": "rewrite",
+    "transforms.unwrap.drop.tombstones": "false",
+
+    "transforms.addMetadata.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.addMetadata.static.field": "_pipeline_version",
+    "transforms.addMetadata.static.value": "1.0",
+
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true",
+    "errors.deadletterqueue.topic.name": "prod.dlq.errors",
+    "errors.deadletterqueue.topic.replication.factor": "1",
+
+    "heartbeat.interval.ms": "10000",
+    "max.batch.size": "2048",
+    "max.queue.size": "8192"
+  }
+}
+
