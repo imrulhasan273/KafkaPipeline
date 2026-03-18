@@ -655,7 +655,15 @@ docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topi
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic _connect-offsets --partitions 25 --replication-factor 1 --if-not-exists
 
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic _connect-status --partitions 5 --replication-factor 1 --if-not-exists
+
+# Required by Debezium heartbeat (prevents UNKNOWN_TOPIC_OR_PARTITION warnings)
+docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic __debezium-heartbeat.prod.mysql --partitions 1 --replication-factor 1 --if-not-exists
+
+# Required by Debezium schema changes (include.schema.changes: true)
+docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.mysql --partitions 1 --replication-factor 1 --if-not-exists
 ```
+
+> **Note:** These 2 topics are required by Debezium. Without them you will see UNKNOWN_TOPIC_OR_PARTITION warnings in kafka-connect logs and the heartbeat will fail.
 
 - [ ] Topics created without errors
 
@@ -671,6 +679,8 @@ docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topi
    - `prod.mysql.sourcedb.products` (3 partitions)
    - `prod.dlq.errors` (1 partition)
    - `_connect-configs`, `_connect-offsets`, `_connect-status`
+   - `__debezium-heartbeat.prod.mysql` (1 partition)
+   - `prod.mysql` (1 partition)
 
 Alternatively, verify via CLI:
 
@@ -713,6 +723,10 @@ Key decisions in this config:
 - `ExtractNewRecordState` transform — unwraps the Debezium envelope so the Kafka message contains the flat row (not nested `before`/`after`)
 - DLQ configured so bad records don't block the connector
 
+> **CRITICAL — schemas.enable must be true:** The Debezium JDBC Sink Connector requires embedded schema information in messages. Setting `schemas.enable: false` causes `valueSchema() is null` errors and the sink will FAIL silently.
+
+> **CRITICAL — drop.tombstones must be true:** When MySQL DELETEs a row, Debezium sends both a rewrite record (`__deleted: true`) AND a tombstone (null value). The Debezium JDBC Sink crashes on tombstone messages with `primary key mode 'record_value' cannot have null schema`. Setting `drop.tombstones: true` prevents tombstones from reaching the sink.
+
 ```json
 {
   "name": "mysql-cdc-source",
@@ -739,15 +753,15 @@ Key decisions in this config:
     "snapshot.locking.mode": "minimal",
 
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable": "false",
+    "key.converter.schemas.enable": "true",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "true",
 
     "transforms": "unwrap,addMetadata",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
     "transforms.unwrap.add.fields": "op,ts_ms,source.db,source.table",
     "transforms.unwrap.delete.handling.mode": "rewrite",
-    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.unwrap.drop.tombstones": "true",
 
     "transforms.addMetadata.type": "org.apache.kafka.connect.transforms.InsertField$Value",
     "transforms.addMetadata.static.field": "_pipeline_version",
@@ -805,7 +819,7 @@ Expected response — the connector config echoed back as JSON with no error fie
 Wait 10–15 seconds for the connector to start, then:
 
 ```powershell
-curl http://localhost:8083/connectors/mysql-cdc-source/status
+curl.exe http://localhost:8083/connectors/mysql-cdc-source/status
 ```
 
 Expected output:
@@ -854,6 +868,25 @@ In Kafka UI (http://localhost:8090):
 3. You should see 2 messages from the initial snapshot
 
 - [ ] Messages appear in `prod.mysql.sourcedb.orders` topic
+
+---
+
+## Step 4.5 — Important: snapshot.mode and existing data
+
+> **Why existing MySQL rows may not appear in Kafka:**
+>
+> `snapshot.mode: initial` takes a snapshot ONLY if no connector offsets exist. If you delete and re-register the connector with the same name, it finds existing offsets in `_connect-offsets` and SKIPS the snapshot. Only new changes (INSERT/UPDATE/DELETE) will be captured.
+>
+> **To force existing rows into Kafka**, trigger a real UPDATE on them:
+> ```sql
+> -- Changes something real so MySQL generates a binlog event
+> UPDATE orders SET updated_at = NOW() WHERE id IN (1, 2, 3);
+> -- For tables without updated_at, change any column value:
+> UPDATE customers SET phone = '+1-555-0101' WHERE id = 1;
+> ```
+>
+> **IMPORTANT — MySQL no-op UPDATE rule:**
+> MySQL will NOT generate a binlog event if the UPDATE doesn't actually change any value. Always update to a different value, otherwise no CDC event is produced.
 
 ---
 
@@ -923,9 +956,9 @@ Key decisions:
     "table.name.format": "pipeline.${topic}",
 
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable": "false",
+    "key.converter.schemas.enable": "true",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "true",
 
     "transforms": "router",
     "transforms.router.type": "org.apache.kafka.connect.transforms.RegexRouter",
@@ -995,7 +1028,30 @@ Expected: both `connector.state` and `tasks[*].state` are `RUNNING`.
 
 ---
 
-## Step 5.4 — Verify data flowed MySQL → Kafka → PostgreSQL
+## Step 5.4 — Understanding DELETE behaviour
+
+MySQL DELETEs are handled as **soft deletes** in PostgreSQL. The row is NOT removed — it is updated with `__deleted: true` and `__op: d`.
+
+```powershell
+# Test: delete a row in MySQL
+docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "DELETE FROM orders WHERE id = 5;"
+
+# Check PostgreSQL — row stays but __deleted = true
+docker exec postgres-target psql -U kafka_user -d targetdb -c "SELECT id, __op, __deleted FROM pipeline.orders WHERE id=5;"
+```
+
+Expected result:
+```
+ id | __op | __deleted
+----+------+-----------
+  5 | d    | true
+```
+
+This is intentional — you keep a full audit trail. If you want hard deletes (physical removal from PostgreSQL), contact the advanced configuration in `06-data-sink.md`.
+
+---
+
+## Step 5.5 — Verify data flowed MySQL → Kafka → PostgreSQL
 
 Wait 30 seconds for the sink to process the initial snapshot messages, then:
 
@@ -1015,7 +1071,7 @@ Expected: Alice Johnson and Bob Smith rows.
 
 ---
 
-## Step 5.5 — List all running connectors
+## Step 5.6 — List all running connectors
 
 ```powershell
 curl http://localhost:8083/connectors
@@ -1055,6 +1111,33 @@ Expected:
 **Sink shows `RUNNING` but no data in PostgreSQL**
 - Check consumer lag: `docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group connect-postgres-sink`
 - If lag is 0, data was processed. If lag is non-zero, the sink is behind — wait.
+
+**Error: `primary key mode 'record_value' cannot have null schema` — sink tasks FAILED**
+- Cause: A tombstone message (null value) from a MySQL DELETE is in the topic. The Debezium JDBC sink crashes on null-value records.
+- Root fix: Ensure source connector has `drop.tombstones: true` (already set in the config above).
+- Recovery (if tombstones already exist in the topic):
+  ```powershell
+  # 1. Delete the sink connector
+  curl.exe -X DELETE http://localhost:8083/connectors/postgres-sink
+
+  # 2. Reset consumer offsets to latest (skips all stuck tombstone messages)
+  docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --reset-offsets --group connect-postgres-sink --topic prod.mysql.sourcedb.orders --to-latest --execute
+  docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --reset-offsets --group connect-postgres-sink --topic prod.mysql.sourcedb.customers --to-latest --execute
+
+  # 3. Re-register the sink connector
+  curl.exe -X POST http://localhost:8083/connectors -H "Content-Type: application/json" -d "@connectors/sink/postgres-sink.json"
+  ```
+- After recovery, re-run any MySQL updates that were skipped.
+
+**Error: sink RUNNING but 0 rows in PostgreSQL**
+- Cause 1: Old messages in topic were produced with `schemas.enable: false`. Sink needs schemas.
+  - Fix: Delete topics, delete connectors, recreate topics, re-register connectors.
+- Cause 2: Existing pipeline.orders/pipeline.customers tables have extra columns (`_cdc_op`, `_ingested_at`) that conflict with Debezium's auto-create.
+  - Fix: Drop those tables and let Debezium JDBC sink create them fresh with `schema.evolution: basic`.
+  ```powershell
+  docker exec postgres-target psql -U kafka_user -d targetdb -c "DROP TABLE IF EXISTS pipeline.orders; DROP TABLE IF EXISTS pipeline.customers;"
+  curl.exe -X POST http://localhost:8083/connectors/postgres-sink/restart?includeTasks=true
+  ```
 
 ---
 
@@ -2020,6 +2103,11 @@ After completing all 8 phases, verify the full end-to-end pipeline:
 | ModuleNotFoundError | 6 | Activate venv: `.\.venv\Scripts\Activate.ps1` |
 | Consumer lag never returns to 0 | 8 | Increase `tasks.max` in sink connector config |
 | DLQ has messages | 8 | Inspect with `kafka-console-consumer` to find root cause |
+| `schemas.enable: false` on source/sink | 4/5 | Set both key and value schemas.enable to true in both connectors |
+| `drop.tombstones: false` | 4 | Set drop.tombstones: true in source connector; reset sink offsets to recover |
+| Tombstones crash sink tasks | 5 | Delete sink, reset offsets to latest, re-register sink |
+| MySQL no-op UPDATE not captured | 4 | MySQL skips binlog for no-change UPDATEs — always update to a different value |
+| `UNKNOWN_TOPIC_OR_PARTITION: prod.mysql` | 3 | Create prod.mysql and __debezium-heartbeat.prod.mysql topics |
 
 ---
 

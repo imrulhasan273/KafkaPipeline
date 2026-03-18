@@ -4,7 +4,7 @@
     "connector.class": "io.debezium.connector.mysql.MySqlConnector",
     "tasks.max": "1",
 
-    
+
     "database.hostname": "mysql",
     "database.port": "3306",
     "database.user": "kafka_user",
@@ -24,15 +24,15 @@
     "snapshot.locking.mode": "minimal",
 
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable": "false",
+    "key.converter.schemas.enable": "true",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "true",
 
     "transforms": "unwrap,addMetadata",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
     "transforms.unwrap.add.fields": "op,ts_ms,source.db,source.table",
     "transforms.unwrap.delete.handling.mode": "rewrite",
-    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.unwrap.drop.tombstones": "true",
 
     "transforms.addMetadata.type": "org.apache.kafka.connect.transforms.InsertField$Value",
     "transforms.addMetadata.static.field": "_pipeline_version",

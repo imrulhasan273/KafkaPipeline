@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e \":*)",
+      "Bash(docker exec:*)"
+    ]
+  }
+}
