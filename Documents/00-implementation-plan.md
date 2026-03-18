@@ -58,8 +58,8 @@ Monitoring: Prometheus + Grafana + Kafka UI + Kafka Exporter
 ### Database ports (depends on your option)
 | Service | Option A (Docker) | Option B (VPS) |
 |---------|------------------|----------------|
-| MySQL | `localhost:3307` | `YOUR_VPS_IP:3306` |
-| PostgreSQL | `localhost:5432` | `YOUR_VPS_IP:5432` |
+| MySQL | `localhost:3307` | `62.171.177.208:3306` |
+| PostgreSQL | `localhost:5432` | `62.171.177.208:5432` |
 
 ---
 
@@ -226,8 +226,12 @@ FLUSH PRIVILEGES;
 
 # 3. Create source database and tables
 mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS sourcedb;"
-mysql -u kafka_user -p ImR$$L007 sourcedb < scripts/mysql-init.sql
+
+# Run mysql-init.sql ON THE VPS (copy the file to VPS first or paste contents)
+mysql -u kafka_user -p'ImR$$L007' sourcedb < scripts/mysql-init.sql
 ```
+
+> **Note:** The `mysql-init.sql` file creates the `orders` and `customers` tables and inserts sample data. Run it on your VPS MySQL so the source tables exist before registering the CDC connector.
 
 ```bash
 # 4. Allow remote connections — open port 3306 in firewall
@@ -273,21 +277,48 @@ host    all    all    0.0.0.0/0    md5
 # 3. Restart PostgreSQL
 sudo systemctl restart postgresql
 
-# 4. Create user, database, schema
+# 4. Create user, database, schema, and target tables
 sudo -u postgres psql -c "CREATE USER kafka_user WITH PASSWORD 'ImR\$\$L007';"
 sudo -u postgres psql -c "CREATE DATABASE targetdb OWNER kafka_user;"
 sudo -u postgres psql -d targetdb -c "CREATE SCHEMA IF NOT EXISTS pipeline AUTHORIZATION kafka_user;"
 sudo -u postgres psql -d targetdb -c "GRANT ALL PRIVILEGES ON SCHEMA pipeline TO kafka_user;"
 
-# 5. Open port 5432 in firewall
+# 5. Run postgres-init.sql ON THE VPS to create target tables
+# Copy scripts/postgres-init.sql to VPS first, then run:
+sudo -u postgres psql -d targetdb < scripts/postgres-init.sql
+
+# OR paste directly:
+sudo -u postgres psql -d targetdb -c "
+CREATE TABLE IF NOT EXISTS pipeline.orders (
+    id           BIGINT PRIMARY KEY,
+    customer_id  BIGINT,
+    product_id   BIGINT,
+    quantity     INT,
+    amount       NUMERIC(10,2),
+    status       VARCHAR(50),
+    created_at   TIMESTAMP,
+    updated_at   TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS pipeline.customers (
+    id           BIGINT PRIMARY KEY,
+    name         VARCHAR(255),
+    email        VARCHAR(255),
+    phone        VARCHAR(50),
+    created_at   TIMESTAMP
+);
+"
+
+# 6. Open port 5432 in firewall
 sudo ufw allow 5432/tcp
 ```
 
+> **Note:** The Debezium JDBC sink connector with `schema.evolution: basic` will auto-create and evolve the tables. Running `postgres-init.sql` manually is optional — but recommended so you have the correct schema ready before data flows in.
+
 ```bash
-# 6. Verify connection from your Windows machine
-# (run in PowerShell — tests connectivity before registering connectors)
-curl.exe -v telnet://YOUR_VPS_IP:3306
-curl.exe -v telnet://YOUR_VPS_IP:5432
+# 7. Verify connection from your Windows machine (run in PowerShell)
+Test-NetConnection -ComputerName 62.171.177.208 -Port 3306
+Test-NetConnection -ComputerName 62.171.177.208 -Port 5432
+# TcpTestSucceeded: True = reachable
 ```
 
 ---
@@ -1080,7 +1111,7 @@ If using a VPS MySQL, change these fields in the JSON:
 
 | Field | Option A (Docker) | Option B (VPS) |
 |-------|------------------|----------------|
-| `database.hostname` | `"mysql"` | `"YOUR_VPS_IP"` e.g. `"31.220.75.206"` |
+| `database.hostname` | `"mysql"` | `"62.171.177.208"` e.g. `"31.220.75.206"` |
 | `database.port` | `"3306"` | `"3306"` (or your custom port) |
 | `database.user` | `"kafka_user"` | your MySQL user |
 | `database.password` | `"kafka_password"` | `"ImR$$L007"` |
@@ -1297,13 +1328,13 @@ If using a VPS PostgreSQL, change these fields in the JSON:
 
 | Field | Option A (Docker) | Option B (VPS) |
 |-------|------------------|----------------|
-| `connection.url` | `"jdbc:postgresql://postgres:5432/targetdb"` | `"jdbc:postgresql://YOUR_VPS_IP:5432/targetdb"` |
+| `connection.url` | `"jdbc:postgresql://postgres:5432/targetdb"` | `"jdbc:postgresql://62.171.177.208:5432/targetdb"` |
 | `connection.username` | `"kafka_user"` | your PostgreSQL user |
 | `connection.password` | `"kafka_password"` | `"ImR$$L007"` |
 
 Example for VPS:
 ```json
-"connection.url": "jdbc:postgresql://YOUR_VPS_IP:5432/targetdb",
+"connection.url": "jdbc:postgresql://62.171.177.208:5432/targetdb",
 "connection.username": "kafka_user",
 "connection.password": "ImR$$L007",
 ```
@@ -1311,7 +1342,7 @@ Example for VPS:
 > **Test connectivity before registering the connector:**
 > ```powershell
 > # From PowerShell — test if PostgreSQL port is reachable
-> Test-NetConnection -ComputerName YOUR_VPS_IP -Port 5432
+> Test-NetConnection -ComputerName 62.171.177.208 -Port 5432
 > # TcpTestSucceeded: True = reachable
 > ```
 
