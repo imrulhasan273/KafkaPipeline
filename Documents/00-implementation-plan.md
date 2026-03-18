@@ -893,35 +893,33 @@ In Kafka UI (http://localhost:8090):
 
 ## Step 5.1 — Create `connectors/sink/postgres-sink.json`
 
-This configures the Confluent JDBC Sink Connector to read from the Kafka CDC topics and upsert records into PostgreSQL.
+This configures the **Debezium JDBC Sink Connector** to read from the Kafka CDC topics and upsert records into PostgreSQL.
+
+> **Important:** The `debezium/connect:2.6` image includes `io.debezium.connector.jdbc.JdbcSinkConnector` — NOT the Confluent `io.confluent.connect.jdbc.JdbcSinkConnector`. Property names differ between the two.
 
 Key decisions:
-- `insert.mode: upsert` with `pk.fields: id` — safe to replay; duplicate messages produce the same result
-- `auto.create: true` — creates the table if it doesn't exist (relies on `table.name.format`)
-- `table.name.format: pipeline.${topic}` — maps `prod.mysql.sourcedb.orders` → `pipeline.prod.mysql.sourcedb.orders`
-
-> **Note on table naming:** The JDBC Sink uses the full topic name to construct the table name by default. Since the topic name contains dots, PostgreSQL will create a table named `pipeline."prod.mysql.sourcedb.orders"`. This works correctly — JDBC Sink quotes the table name. The target tables you created in `postgres-init.sql` (`pipeline.orders`, `pipeline.customers`) are separate and can be used with a custom Python consumer (Phase 6). For the sink connector, let it auto-create its own tables.
+- `insert.mode: upsert` with `primary.key.fields: id` — safe to replay; duplicate messages produce the same result
+- `schema.evolution: basic` — auto-creates/evolves the table if it doesn't exist
+- `RegexRouter` transform — maps topic `prod.mysql.sourcedb.orders` → table `pipeline.orders`
 
 ```json
 {
   "name": "postgres-sink",
   "config": {
-    "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
+    "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
     "tasks.max": "2",
 
     "connection.url": "jdbc:postgresql://postgres:5432/targetdb",
-    "connection.user": "kafka_user",
+    "connection.username": "kafka_user",
     "connection.password": "kafka_password",
 
     "topics": "prod.mysql.sourcedb.orders,prod.mysql.sourcedb.customers",
 
     "insert.mode": "upsert",
-    "pk.mode": "record_value",
-    "pk.fields": "id",
+    "primary.key.mode": "record_value",
+    "primary.key.fields": "id",
 
-    "auto.create": "true",
-    "auto.evolve": "true",
-
+    "schema.evolution": "basic",
     "table.name.format": "pipeline.${topic}",
 
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
@@ -929,9 +927,10 @@ Key decisions:
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter.schemas.enable": "false",
 
-    "transforms": "dropMetaFields",
-    "transforms.dropMetaFields.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
-    "transforms.dropMetaFields.exclude": "__op,__ts_ms,__source_db,__source_table,_pipeline_version",
+    "transforms": "router",
+    "transforms.router.type": "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.router.regex": "prod\\.mysql\\.sourcedb\\.(.*)",
+    "transforms.router.replacement": "$1",
 
     "batch.size": "3000",
     "max.retries": "10",
@@ -939,11 +938,18 @@ Key decisions:
 
     "errors.tolerance": "all",
     "errors.log.enable": "true",
-    "errors.deadletterqueue.topic.name": "prod.dlq.errors",
-    "errors.deadletterqueue.context.headers.enable": "true"
+    "errors.deadletterqueue.topic.name": "prod.dlq.errors"
   }
 }
 ```
+
+| Confluent JDBC (old) | Debezium JDBC (correct) |
+|----------------------|------------------------|
+| `io.confluent.connect.jdbc.JdbcSinkConnector` | `io.debezium.connector.jdbc.JdbcSinkConnector` |
+| `connection.user` | `connection.username` |
+| `pk.mode` | `primary.key.mode` |
+| `pk.fields` | `primary.key.fields` |
+| `auto.create: true` | `schema.evolution: basic` |
 
 - [ ] `connectors/sink/postgres-sink.json` created
 
@@ -1028,8 +1034,8 @@ Expected:
 ## Common Errors — Phase 5
 
 **Error: `JdbcSinkConnector not found` or `connector.class not found`**
-- Cause: The Debezium Connect image (`debezium/connect:2.6`) includes Debezium connectors but not the Confluent JDBC Sink.
-- Fix: Install the JDBC Sink connector into the running container:
+- Cause: Using `io.confluent.connect.jdbc.JdbcSinkConnector` — that class is not in the Debezium image.
+- Fix: Use `io.debezium.connector.jdbc.JdbcSinkConnector` (already corrected in the JSON above).
   ```powershell
   docker exec kafka-connect confluent-hub install confluentinc/kafka-connect-jdbc:10.7.4 --no-prompt
   docker restart kafka-connect
@@ -2009,7 +2015,7 @@ After completing all 8 phases, verify the full end-to-end pipeline:
 | Out of memory errors | 2 | Increase Docker Desktop memory to 8 GB |
 | `CLUSTER_ID` mismatch | 2 | `docker compose down -v` then restart |
 | Connector state FAILED | 4/5 | Check `docker logs kafka-connect`; check credentials |
-| `JdbcSinkConnector not found` | 5 | Install via `confluent-hub install` inside container |
+| `JdbcSinkConnector not found` | 5 | Use `io.debezium.connector.jdbc.JdbcSinkConnector` not Confluent class |
 | No data in PostgreSQL | 5 | Check consumer lag; verify connector RUNNING |
 | ModuleNotFoundError | 6 | Activate venv: `.\.venv\Scripts\Activate.ps1` |
 | Consumer lag never returns to 0 | 8 | Increase `tasks.max` in sink connector config |
