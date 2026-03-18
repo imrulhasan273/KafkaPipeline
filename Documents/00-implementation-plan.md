@@ -44,17 +44,22 @@ Monitoring: Prometheus + Grafana + Kafka UI + Kafka Exporter
 
 ## Port Map (Quick Reference)
 
+### Docker services (always local)
 | Service | Port | URL |
 |---------|------|-----|
 | Kafka (broker) | 9092 | — |
 | Schema Registry | 8081 | http://localhost:8081 |
 | Kafka Connect | 8083 | http://localhost:8083 |
 | Kafka UI | 8090 | http://localhost:8090 |
-| MySQL | 3307 | — |
-| PostgreSQL | 5432 | — |
 | Prometheus | 9090 | http://localhost:9090 |
 | Grafana | 3000 | http://localhost:3000 |
 | Kafka Exporter | 9308 | http://localhost:9308/metrics |
+
+### Database ports (depends on your option)
+| Service | Option A (Docker) | Option B (VPS) |
+|---------|------------------|----------------|
+| MySQL | `localhost:3307` | `YOUR_VPS_IP:3306` |
+| PostgreSQL | `localhost:5432` | `YOUR_VPS_IP:5432` |
 
 ---
 
@@ -165,6 +170,128 @@ mysql-connector-python==8.3.0
 
 ---
 
+## Step 2.1 — Choose your Database Option
+
+Before creating `docker-compose.yml`, decide where your MySQL and PostgreSQL will run:
+
+| Option | MySQL/PG location | Best for |
+|--------|------------------|----------|
+| **Option A: Docker** | Runs as Docker containers | Local dev, clean environment, no existing DB |
+| **Option B: VPS / External** | Runs on your Linux VPS or remote server | You already have a running DB, production-like setup |
+
+---
+
+### Option B Pre-requisites — VPS Database Setup
+
+> **Do this BEFORE creating docker-compose.yml if using Option B.**
+
+#### MySQL on VPS — Required configuration
+
+SSH into your VPS and run:
+
+```bash
+# 1. Check binlog is enabled
+mysql -u root -p -e "SHOW VARIABLES LIKE 'log_bin';"
+# Must show: log_bin = ON
+
+mysql -u root -p -e "SHOW VARIABLES LIKE 'binlog_format';"
+# Must show: binlog_format = ROW
+```
+
+If binlog is OFF, edit `/etc/mysql/mysql.conf.d/mysqld.cnf` (Ubuntu) or `/etc/my.cnf` (CentOS):
+
+```ini
+[mysqld]
+server-id         = 1
+log_bin           = mysql-bin
+binlog_format     = ROW
+binlog_row_image  = FULL
+gtid_mode         = ON
+enforce_gtid_consistency = ON
+```
+
+Then restart MySQL:
+```bash
+sudo systemctl restart mysql
+```
+
+```bash
+# 2. Create user and grant CDC permissions
+mysql -u root -p -e "
+CREATE USER IF NOT EXISTS 'kafka_user'@'%' IDENTIFIED BY 'kafka_password';
+GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'kafka_user'@'%';
+GRANT ALL PRIVILEGES ON sourcedb.* TO 'kafka_user'@'%';
+FLUSH PRIVILEGES;
+"
+
+# 3. Create source database and tables
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS sourcedb;"
+mysql -u kafka_user -pkafka_password sourcedb < scripts/mysql-init.sql
+```
+
+```bash
+# 4. Allow remote connections — open port 3306 in firewall
+sudo ufw allow 3306/tcp       # Ubuntu UFW
+# OR
+sudo firewall-cmd --permanent --add-port=3306/tcp && sudo firewall-cmd --reload  # CentOS firewalld
+```
+
+Also check MySQL bind-address in config — must NOT be `127.0.0.1`:
+```ini
+# /etc/mysql/mysql.conf.d/mysqld.cnf
+bind-address = 0.0.0.0   # allow connections from all IPs
+```
+
+---
+
+#### PostgreSQL on VPS — Required configuration
+
+```bash
+# 1. Edit postgresql.conf — enable logical replication
+sudo nano /etc/postgresql/*/main/postgresql.conf
+```
+
+Set these values:
+```ini
+wal_level = logical
+max_wal_senders = 10
+max_replication_slots = 10
+listen_addresses = '*'
+```
+
+```bash
+# 2. Edit pg_hba.conf — allow remote connections
+sudo nano /etc/postgresql/*/main/pg_hba.conf
+```
+
+Add this line:
+```
+host    all    all    0.0.0.0/0    md5
+```
+
+```bash
+# 3. Restart PostgreSQL
+sudo systemctl restart postgresql
+
+# 4. Create user, database, schema
+sudo -u postgres psql -c "CREATE USER kafka_user WITH PASSWORD 'kafka_password';"
+sudo -u postgres psql -c "CREATE DATABASE targetdb OWNER kafka_user;"
+sudo -u postgres psql -d targetdb -c "CREATE SCHEMA IF NOT EXISTS pipeline AUTHORIZATION kafka_user;"
+sudo -u postgres psql -d targetdb -c "GRANT ALL PRIVILEGES ON SCHEMA pipeline TO kafka_user;"
+
+# 5. Open port 5432 in firewall
+sudo ufw allow 5432/tcp
+```
+
+```bash
+# 6. Verify connection from your Windows machine
+# (run in PowerShell — tests connectivity before registering connectors)
+curl.exe -v telnet://YOUR_VPS_IP:3306
+curl.exe -v telnet://YOUR_VPS_IP:5432
+```
+
+---
+
 ## Step 2.1 — Create `docker-compose.yml`
 
 Create `kafka-pipeline/docker-compose.yml` with the following content.
@@ -173,6 +300,8 @@ Create `kafka-pipeline/docker-compose.yml` with the following content.
 - No `version:` field — it is deprecated and causes a warning on Docker Compose v5.x
 - Uses `KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"` for inter-container communication. The `kafka-ui` and connector containers reference `kafka:9092`, not `localhost:9092`.
 - Healthchecks ensure services start in the correct order.
+
+**Choose the block that matches your Option (A or B) below.**
 
 ```yaml
 services:
@@ -364,6 +493,168 @@ volumes:
   postgres-data:
   grafana-data:
 ```
+
+---
+
+### Option B: docker-compose.yml (VPS databases — no MySQL/PostgreSQL containers)
+
+> Use this if your MySQL and PostgreSQL are running on a VPS or remote server.
+> Remove the `mysql` and `postgres` service blocks. Everything else stays the same.
+
+```yaml
+services:
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+      - "7071:7071"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_JMX_PORT: 7071
+      KAFKA_JMX_HOSTNAME: kafka
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:9092
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "kafka:9092"
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: "_schemas"
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: "BACKWARD"
+    healthcheck:
+      test: curl -f http://localhost:8081/subjects || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kafka-connect:
+    image: debezium/connect:2.6
+    hostname: kafka-connect
+    container_name: kafka-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:9092"
+      GROUP_ID: "kafka-connect-cluster"
+      CONFIG_STORAGE_TOPIC: "_connect-configs"
+      OFFSET_STORAGE_TOPIC: "_connect-offsets"
+      STATUS_STORAGE_TOPIC: "_connect-status"
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_PLUGIN_PATH: "/kafka/connect,/usr/share/confluent-hub-components"
+    volumes:
+      - ./connectors:/kafka/connect/custom
+    healthcheck:
+      test: curl -f http://localhost:8083/ || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+      - schema-registry
+      - kafka-connect
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    command:
+      - "--kafka.server=kafka:9092"
+      - "--web.listen-address=:9308"
+      - "--topic.filter=.*"
+      - "--group.filter=.*"
+    ports:
+      - "9308:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+
+# NOTE: No mysql or postgres services — using VPS databases
+volumes:
+  kafka-data:
+  grafana-data:
+```
+
+> **After using Option B docker-compose.yml**, skip Steps 2.2 (mysql-init.sql) and 2.3 (postgres-init.sql) — those only apply to Docker databases. Your VPS databases are already configured from the pre-requisites above.
+
+---
 
 - [ ] `docker-compose.yml` created
 
@@ -718,14 +1009,17 @@ docker exec kafka kafka-topics --list --bootstrap-server localhost:9092
 This configures the Debezium MySQL connector to read the MySQL binlog and publish change events to Kafka topics.
 
 Key decisions in this config:
-- Uses `kafka_user` (the same user created in `mysql-init.sql`) — no separate Debezium user needed for dev
 - `snapshot.mode: initial` — takes a full snapshot of existing data on first start, then streams changes
-- `ExtractNewRecordState` transform — unwraps the Debezium envelope so the Kafka message contains the flat row (not nested `before`/`after`)
+- `ExtractNewRecordState` transform — unwraps the Debezium envelope so the Kafka message contains the flat row
 - DLQ configured so bad records don't block the connector
 
 > **CRITICAL — schemas.enable must be true:** The Debezium JDBC Sink Connector requires embedded schema information in messages. Setting `schemas.enable: false` causes `valueSchema() is null` errors and the sink will FAIL silently.
 
 > **CRITICAL — drop.tombstones must be true:** When MySQL DELETEs a row, Debezium sends both a rewrite record (`__deleted: true`) AND a tombstone (null value). The Debezium JDBC Sink crashes on tombstone messages with `primary key mode 'record_value' cannot have null schema`. Setting `drop.tombstones: true` prevents tombstones from reaching the sink.
+
+**Option A (Docker MySQL):** Use `"database.hostname": "mysql"` — the Docker service name.
+
+**Option B (VPS MySQL):** Replace `"database.hostname"` and credentials with your VPS values. See the substitution table below the JSON.
 
 ```json
 {
@@ -779,6 +1073,19 @@ Key decisions in this config:
   }
 }
 ```
+
+### Option B — VPS MySQL substitutions
+
+If using a VPS MySQL, change these fields in the JSON:
+
+| Field | Option A (Docker) | Option B (VPS) |
+|-------|------------------|----------------|
+| `database.hostname` | `"mysql"` | `"YOUR_VPS_IP"` e.g. `"31.220.75.206"` |
+| `database.port` | `"3306"` | `"3306"` (or your custom port) |
+| `database.user` | `"kafka_user"` | your MySQL user |
+| `database.password` | `"kafka_password"` | your MySQL password |
+| `database.include.list` | `"sourcedb"` | your database name |
+| `table.include.list` | `"sourcedb.orders,sourcedb.customers"` | `"yourdb.yourtable"` |
 
 - [ ] `connectors/source/mysql-cdc-source.json` created
 
@@ -983,6 +1290,30 @@ Key decisions:
 | `pk.mode` | `primary.key.mode` |
 | `pk.fields` | `primary.key.fields` |
 | `auto.create: true` | `schema.evolution: basic` |
+
+### Option B — VPS PostgreSQL substitutions
+
+If using a VPS PostgreSQL, change these fields in the JSON:
+
+| Field | Option A (Docker) | Option B (VPS) |
+|-------|------------------|----------------|
+| `connection.url` | `"jdbc:postgresql://postgres:5432/targetdb"` | `"jdbc:postgresql://YOUR_VPS_IP:5432/targetdb"` |
+| `connection.username` | `"kafka_user"` | your PostgreSQL user |
+| `connection.password` | `"kafka_password"` | your PostgreSQL password |
+
+Example for VPS:
+```json
+"connection.url": "jdbc:postgresql://31.220.75.206:5432/targetdb",
+"connection.username": "kafka_user",
+"connection.password": "kafka_password",
+```
+
+> **Test connectivity before registering the connector:**
+> ```powershell
+> # From PowerShell — test if PostgreSQL port is reachable
+> Test-NetConnection -ComputerName YOUR_VPS_IP -Port 5432
+> # TcpTestSucceeded: True = reachable
+> ```
 
 - [ ] `connectors/sink/postgres-sink.json` created
 
