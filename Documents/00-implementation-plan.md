@@ -218,7 +218,7 @@ sudo systemctl restart mysql
 ```bash
 # 2. Create user and grant CDC permissions
 mysql -u root -p -e "
-CREATE USER IF NOT EXISTS 'kafka_user'@'%' IDENTIFIED BY 'kafka_password';
+CREATE USER IF NOT EXISTS 'kafka_user'@'%' IDENTIFIED BY 'ImR$$L007';
 GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'kafka_user'@'%';
 GRANT ALL PRIVILEGES ON sourcedb.* TO 'kafka_user'@'%';
 FLUSH PRIVILEGES;
@@ -226,7 +226,7 @@ FLUSH PRIVILEGES;
 
 # 3. Create source database and tables
 mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS sourcedb;"
-mysql -u kafka_user -pkafka_password sourcedb < scripts/mysql-init.sql
+mysql -u kafka_user -p ImR$$L007 sourcedb < scripts/mysql-init.sql
 ```
 
 ```bash
@@ -274,7 +274,7 @@ host    all    all    0.0.0.0/0    md5
 sudo systemctl restart postgresql
 
 # 4. Create user, database, schema
-sudo -u postgres psql -c "CREATE USER kafka_user WITH PASSWORD 'kafka_password';"
+sudo -u postgres psql -c "CREATE USER kafka_user WITH PASSWORD 'ImR\$\$L007';"
 sudo -u postgres psql -c "CREATE DATABASE targetdb OWNER kafka_user;"
 sudo -u postgres psql -d targetdb -c "CREATE SCHEMA IF NOT EXISTS pipeline AUTHORIZATION kafka_user;"
 sudo -u postgres psql -d targetdb -c "GRANT ALL PRIVILEGES ON SCHEMA pipeline TO kafka_user;"
@@ -1083,7 +1083,7 @@ If using a VPS MySQL, change these fields in the JSON:
 | `database.hostname` | `"mysql"` | `"YOUR_VPS_IP"` e.g. `"31.220.75.206"` |
 | `database.port` | `"3306"` | `"3306"` (or your custom port) |
 | `database.user` | `"kafka_user"` | your MySQL user |
-| `database.password` | `"kafka_password"` | your MySQL password |
+| `database.password` | `"kafka_password"` | `"ImR$$L007"` |
 | `database.include.list` | `"sourcedb"` | your database name |
 | `table.include.list` | `"sourcedb.orders,sourcedb.customers"` | `"yourdb.yourtable"` |
 
@@ -1299,13 +1299,13 @@ If using a VPS PostgreSQL, change these fields in the JSON:
 |-------|------------------|----------------|
 | `connection.url` | `"jdbc:postgresql://postgres:5432/targetdb"` | `"jdbc:postgresql://YOUR_VPS_IP:5432/targetdb"` |
 | `connection.username` | `"kafka_user"` | your PostgreSQL user |
-| `connection.password` | `"kafka_password"` | your PostgreSQL password |
+| `connection.password` | `"kafka_password"` | `"ImR$$L007"` |
 
 Example for VPS:
 ```json
-"connection.url": "jdbc:postgresql://31.220.75.206:5432/targetdb",
+"connection.url": "jdbc:postgresql://YOUR_VPS_IP:5432/targetdb",
 "connection.username": "kafka_user",
-"connection.password": "kafka_password",
+"connection.password": "ImR$$L007",
 ```
 
 > **Test connectivity before registering the connector:**
