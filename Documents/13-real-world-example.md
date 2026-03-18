@@ -132,7 +132,7 @@ docker exec kafka kafka-run-class kafka.tools.GetOffsetShell \
   --topic prod.mysql.sourcedb.orders
 ```
 
-Open Kafka UI: http://localhost:8080
+Open Kafka UI: http://localhost:8090
 - Navigate to Topics → `prod.mysql.sourcedb.orders`
 - You should see the initial snapshot messages
 
@@ -242,7 +242,7 @@ import time
 import random
 
 MYSQL_CONFIG = {
-    "host": "localhost", "port": 3306,
+    "host": "localhost", "port": 3307,
     "database": "sourcedb", "user": "kafka_user", "password": "kafka_password"
 }
 PG_CONFIG = {

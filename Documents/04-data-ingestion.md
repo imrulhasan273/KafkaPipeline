@@ -43,10 +43,10 @@ FLUSH PRIVILEGES;
     "snapshot.mode": "initial",
     "snapshot.locking.mode": "minimal",
 
-    "key.converter": "io.confluent.connect.avro.AvroConverter",
-    "key.converter.schema.registry.url": "http://schema-registry:8081",
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable: "false"
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable: "false"
 
     "transforms": "unwrap,addMetadata",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
@@ -137,10 +137,10 @@ SELECT * FROM pg_publication;
     "snapshot.mode": "initial",
     "snapshot.isolation.mode": "read_committed",
 
-    "key.converter": "io.confluent.connect.avro.AvroConverter",
-    "key.converter.schema.registry.url": "http://schema-registry:8081",
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable: "false"
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable: "false"
 
     "transforms": "unwrap",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
@@ -216,10 +216,10 @@ GRANT LOGMINING TO c##debezium CONTAINER=ALL;
 
     "snapshot.mode": "initial",
 
-    "key.converter": "io.confluent.connect.avro.AvroConverter",
-    "key.converter.schema.registry.url": "http://schema-registry:8081",
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable: "false"
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable: "false"
 
     "transforms": "unwrap",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
@@ -258,8 +258,8 @@ For databases without CDC capability or for scheduled batch loads.
     "numeric.mapping": "best_fit",
     "timestamp.delay.interval.ms": "1000",
 
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081"
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable: "false"
   }
 }
 ```
@@ -288,8 +288,8 @@ For databases without CDC capability or for scheduled batch loads.
     "csv.null.field.indicator": "EMPTY_SEPARATORS",
 
     "key.converter": "org.apache.kafka.connect.storage.StringConverter",
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable: "false"
 
     "schema.generation.enabled": "true",
     "schema.generation.key.fields": "id",

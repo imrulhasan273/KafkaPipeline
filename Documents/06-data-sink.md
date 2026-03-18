@@ -36,10 +36,10 @@ The Confluent JDBC Sink Connector writes Kafka records to any JDBC-compatible da
 
     "table.name.format": "pipeline.${topic}",
 
-    "key.converter": "io.confluent.connect.avro.AvroConverter",
-    "key.converter.schema.registry.url": "http://schema-registry:8081",
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable: "false"
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable: "false"
 
     "transforms": "route",
     "transforms.route.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
@@ -77,8 +77,8 @@ The Confluent JDBC Sink Connector writes Kafka records to any JDBC-compatible da
 
     "delete.enabled": "true",
 
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable: "false"
 
     "transforms": "extractValue",
     "transforms.extractValue.type": "io.debezium.transforms.ExtractNewRecordState",
@@ -114,8 +114,8 @@ The Confluent JDBC Sink Connector writes Kafka records to any JDBC-compatible da
 
     "table.name.format": "${topic}",
 
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable: "false"
 
     "dialect.name": "MySqlDatabaseDialect",
     "batch.size": "5000",
@@ -154,8 +154,8 @@ The Confluent JDBC Sink Connector writes Kafka records to any JDBC-compatible da
 
     "table.name.format": "dbo.${topic}",
 
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable: "false"
 
     "dialect.name": "SqlServerDatabaseDialect",
     "batch.size": "2000",

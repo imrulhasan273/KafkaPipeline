@@ -49,8 +49,8 @@ Monitoring: Prometheus + Grafana + Kafka UI + Kafka Exporter
 | Kafka (broker) | 9092 | — |
 | Schema Registry | 8081 | http://localhost:8081 |
 | Kafka Connect | 8083 | http://localhost:8083 |
-| Kafka UI | 8080 | http://localhost:8080 |
-| MySQL | 3306 | — |
+| Kafka UI | 8090 | http://localhost:8090 |
+| MySQL | 3307 | — |
 | PostgreSQL | 5432 | — |
 | Prometheus | 9090 | http://localhost:9090 |
 | Grafana | 3000 | http://localhost:3000 |
@@ -278,7 +278,7 @@ services:
       - schema-registry
       - kafka-connect
     ports:
-      - "8080:8080"
+      - "8090:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -290,7 +290,7 @@ services:
     image: mysql:8.0
     container_name: mysql-source
     ports:
-      - "3306:3306"
+      - "3307:3306"
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
       MYSQL_DATABASE: sourcedb
@@ -336,7 +336,8 @@ services:
     ports:
       - "9308:9308"
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
 
   prometheus:
     image: prom/prometheus:latest
@@ -548,13 +549,13 @@ curl http://localhost:8081/subjects
 curl http://localhost:8083/
 
 # Kafka UI
-# Open http://localhost:8080 in your browser
+# Open http://localhost:8090 in your browser
 ```
 
 - [ ] All containers are running
 - [ ] `curl http://localhost:8081/subjects` returns `[]`
 - [ ] `curl http://localhost:8083/` returns a JSON response
-- [ ] http://localhost:8080 loads the Kafka UI
+- [ ] http://localhost:8090 loads the Kafka UI
 
 ---
 
@@ -662,7 +663,7 @@ docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topi
 
 ## Step 3.3 — Verify topics in Kafka UI
 
-1. Open http://localhost:8080
+1. Open http://localhost:8090
 2. Click **Topics** in the left sidebar
 3. You should see these topics listed:
    - `prod.mysql.sourcedb.orders` (3 partitions)
@@ -840,7 +841,7 @@ docker exec kafka kafka-run-class kafka.tools.GetOffsetShell `
 
 You should see non-zero offsets. The initial snapshot should have published the 2 sample orders.
 
-In Kafka UI (http://localhost:8080):
+In Kafka UI (http://localhost:8090):
 1. Click **Topics** → `prod.mysql.sourcedb.orders`
 2. Click **Messages** tab
 3. You should see 2 messages from the initial snapshot
@@ -1542,7 +1543,7 @@ VALUES (1, 201, 3, 149.99, 'PENDING');
 Expected: Within 1–2 seconds, Terminal 1 should print a new Avro-encoded message (will appear as garbled binary — that is expected for Avro). Use Kafka UI for readable output.
 
 **In Kafka UI:**
-1. Open http://localhost:8080 → **Topics** → `prod.mysql.sourcedb.orders`
+1. Open http://localhost:8090 → **Topics** → `prod.mysql.sourcedb.orders`
 2. Click **Messages** tab
 3. You should see the new message with `__op: "c"` (create)
 
@@ -1743,7 +1744,7 @@ import time
 import random
 
 MYSQL_CONFIG = {
-    "host": "localhost", "port": 3306,
+    "host": "localhost", "port": 3307,
     "database": "sourcedb",
     "user": "kafka_user", "password": "kafka_password"
 }
@@ -1950,7 +1951,7 @@ After completing all 8 phases, verify the full end-to-end pipeline:
 
 ## Infrastructure
 - [ ] All 9 Docker containers running and healthy
-- [ ] Kafka UI accessible at http://localhost:8080
+- [ ] Kafka UI accessible at http://localhost:8090
 - [ ] Schema Registry accessible at http://localhost:8081
 - [ ] Kafka Connect REST API accessible at http://localhost:8083
 - [ ] Prometheus accessible at http://localhost:9090

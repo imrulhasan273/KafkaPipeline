@@ -176,9 +176,9 @@ spec:
             - name: STATUS_STORAGE_TOPIC
               value: "_connect-status"
             - name: KEY_CONVERTER
-              value: "io.confluent.connect.avro.AvroConverter"
+              value: "org.apache.kafka.connect.json.JsonConverter"
             - name: VALUE_CONVERTER
-              value: "io.confluent.connect.avro.AvroConverter"
+              value: "org.apache.kafka.connect.json.JsonConverter"
             - name: KEY_CONVERTER_SCHEMA_REGISTRY_URL
               value: "http://schema-registry.kafka.svc.cluster.local:8081"
             - name: VALUE_CONVERTER_SCHEMA_REGISTRY_URL

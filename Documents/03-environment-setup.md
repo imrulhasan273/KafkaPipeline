@@ -121,8 +121,8 @@ services:
       CONFIG_STORAGE_REPLICATION_FACTOR: 1
       OFFSET_STORAGE_REPLICATION_FACTOR: 1
       STATUS_STORAGE_REPLICATION_FACTOR: 1
-      KEY_CONVERTER: "io.confluent.connect.avro.AvroConverter"
-      VALUE_CONVERTER: "io.confluent.connect.avro.AvroConverter"
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
       KEY_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
       VALUE_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
       CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
@@ -143,7 +143,7 @@ services:
       - schema-registry
       - kafka-connect
     ports:
-      - "8080:8080"
+      - "8090:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -155,7 +155,7 @@ services:
     image: mysql:8.0
     container_name: mysql-source
     ports:
-      - "3306:3306"
+      - "3307:3306"
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
       MYSQL_DATABASE: sourcedb
@@ -351,7 +351,7 @@ sleep 30
 echo "Creating Kafka topics..."
 bash scripts/create-topics.sh
 
-echo "Setup complete. UI available at http://localhost:8080"
+echo "Setup complete. UI available at http://localhost:8090"
 ```
 
 ### `scripts/create-topics.sh`
@@ -490,7 +490,7 @@ check() {
 check "Kafka"           "http://localhost:9092"
 check "Schema Registry" "http://localhost:8081/subjects"
 check "Kafka Connect"   "http://localhost:8083/"
-check "Kafka UI"        "http://localhost:8080"
+check "Kafka UI"        "http://localhost:8090"
 check "Prometheus"      "http://localhost:9090/-/healthy"
 check "Grafana"         "http://localhost:3000/api/health"
 
