@@ -249,7 +249,7 @@ Docker MySQL comes pre-configured with binlog enabled (via the `--log-bin` comma
 SSH into your VPS:
 
 ```bash
-ssh root@YOUR_VPS_IP
+ssh root@62.171.177.208
 ```
 
 **Check if binlog is already enabled:**
@@ -333,7 +333,7 @@ sudo systemctl restart mysqld
 **Verify from Windows:**
 
 ```powershell
-Test-NetConnection -ComputerName YOUR_VPS_IP -Port 3306
+Test-NetConnection -ComputerName 62.171.177.208 -Port 3306
 # TcpTestSucceeded: True = reachable
 ```
 
@@ -405,7 +405,7 @@ sudo ufw allow 5432/tcp
 **Verify from Windows:**
 
 ```powershell
-Test-NetConnection -ComputerName YOUR_VPS_IP -Port 5432
+Test-NetConnection -ComputerName 62.171.177.208 -Port 5432
 # TcpTestSucceeded: True = reachable
 ```
 
@@ -1171,7 +1171,7 @@ Change only these fields:
     "connector.class": "io.debezium.connector.mysql.MySqlConnector",
     "tasks.max": "1",
 
-    "database.hostname": "YOUR_VPS_IP",
+    "database.hostname": "62.171.177.208",
     "database.port": "3306",
     "database.user": "kafka_user",
     "database.password": "YOUR_PASSWORD",
@@ -1219,7 +1219,7 @@ Change only these fields:
 
 | Field | Option A (Docker) | Option B (VPS) |
 |-------|------------------|----------------|
-| `database.hostname` | `"mysql"` | `"YOUR_VPS_IP"` e.g. `"62.171.177.208"` |
+| `database.hostname` | `"mysql"` | `"62.171.177.208"` e.g. `"62.171.177.208"` |
 | `database.password` | `"kafka_password"` | `"YOUR_PASSWORD"` |
 
 ---
@@ -1433,7 +1433,7 @@ Change only these fields:
 
 | Field | Option A (Docker) | Option B (VPS) |
 |-------|------------------|----------------|
-| `connection.url` | `"jdbc:postgresql://postgres:5432/targetdb"` | `"jdbc:postgresql://YOUR_VPS_IP:5432/targetdb"` |
+| `connection.url` | `"jdbc:postgresql://postgres:5432/targetdb"` | `"jdbc:postgresql://62.171.177.208:5432/targetdb"` |
 | `connection.password` | `"kafka_password"` | `"YOUR_PASSWORD"` |
 
 Example VPS values:
@@ -1447,7 +1447,7 @@ Example VPS values:
 > **Test connectivity before registering:**
 > ```powershell
 > # Windows
-> Test-NetConnection -ComputerName YOUR_VPS_IP -Port 5432
+> Test-NetConnection -ComputerName 62.171.177.208 -Port 5432
 > # TcpTestSucceeded: True = reachable
 > ```
 
@@ -1567,7 +1567,214 @@ docker exec postgres-target psql -U kafka_user -d targetdb \
 
 ---
 
-# Phase 8: Full Clean Reset (When Things Go Wrong)
+# Phase 8: Syncing Existing Production Tables (Real-World Setup)
+
+**This is the most common real-world scenario:** Both your MySQL source table and PostgreSQL target table already exist with production data. You want to set up the CDC pipeline between them without losing existing data.
+
+---
+
+## The Challenge
+
+In a fresh setup, Debezium creates the PostgreSQL table automatically. In the real world:
+- MySQL `sourcedb.orders` already has 10,000+ rows
+- PostgreSQL `targetdb.pipeline.orders` already exists (created by DBA, another app, or manually)
+- Column names and types may differ slightly
+- The existing PostgreSQL table may be owned by a different user (not `kafka_user`)
+
+---
+
+## Step 8.1 — Check existing table schemas match
+
+**On VPS MySQL (SSH into 62.171.177.208):**
+
+```bash
+mysql -u kafka_user -p'YOUR_PASSWORD' sourcedb -e "DESCRIBE orders;"
+```
+
+**On VPS PostgreSQL:**
+
+```bash
+psql -U kafka_user -d targetdb -c "\d pipeline.orders"
+```
+
+Compare columns. The PostgreSQL table must have at minimum the same columns as MySQL. Debezium will also add these CDC columns automatically via `ALTER TABLE`:
+- `__deleted` (text)
+- `__op` (text)
+- `__ts_ms` (bigint)
+- `__source_db` (text)
+- `__source_table` (text)
+- `_pipeline_version` (text)
+
+---
+
+## Step 8.2 — Fix table ownership (most common issue)
+
+**Why this matters:** Debezium sink needs to `ALTER TABLE` to add the CDC columns above. If the table is owned by `postgres` (superuser) instead of `kafka_user`, you get:
+```
+ERROR: must be owner of table orders
+```
+
+**Check current owner:**
+
+```bash
+psql -U postgres -d targetdb -c "\dt pipeline.*"
+# Look at the "Owner" column
+```
+
+**Option A — Transfer ownership to kafka_user (keeps existing data):**
+
+```bash
+sudo -u postgres psql -d targetdb -c "ALTER TABLE pipeline.orders OWNER TO kafka_user;"
+sudo -u postgres psql -d targetdb -c "ALTER TABLE pipeline.customers OWNER TO kafka_user;"
+```
+
+**Option B — Drop and let Debezium recreate (loses existing PG data, resync from MySQL):**
+
+```sql
+-- Run as postgres superuser
+DROP TABLE IF EXISTS pipeline.orders;
+DROP TABLE IF EXISTS pipeline.customers;
+```
+
+> Use Option A if you have existing PostgreSQL data you want to keep.
+> Use Option B if PostgreSQL is just a replica and MySQL is the source of truth.
+
+---
+
+## Step 8.3 — Ensure kafka_user has schema privileges
+
+```bash
+sudo -u postgres psql -d targetdb -c "GRANT ALL PRIVILEGES ON SCHEMA pipeline TO kafka_user;"
+sudo -u postgres psql -d targetdb -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA pipeline TO kafka_user;"
+```
+
+---
+
+## Step 8.4 — Point the source connector to your existing MySQL table
+
+Edit `connectors/source/mysql-cdc-source.json` — set `table.include.list` to your actual table(s):
+
+```json
+"database.include.list": "your_production_db",
+"table.include.list": "your_production_db.orders,your_production_db.customers"
+```
+
+Example for this project:
+
+```json
+"database.hostname": "62.171.177.208",
+"database.port": "3306",
+"database.user": "kafka_user",
+"database.password": "YOUR_PASSWORD",
+"database.include.list": "sourcedb",
+"table.include.list": "sourcedb.orders,sourcedb.customers"
+```
+
+---
+
+## Step 8.5 — Point the sink connector to your existing PostgreSQL table
+
+Edit `connectors/sink/postgres-sink.json`:
+
+```json
+"connection.url": "jdbc:postgresql://62.171.177.208:5432/targetdb",
+"connection.username": "kafka_user",
+"connection.password": "YOUR_PASSWORD",
+"topics": "prod.mysql.sourcedb.orders,prod.mysql.sourcedb.customers"
+```
+
+The `RegexRouter` maps topic `prod.mysql.sourcedb.orders` → table name `orders`, and `table.name.format: pipeline.${topic}` makes the final table `pipeline.orders`. This means your existing `pipeline.orders` table will receive the synced data.
+
+---
+
+## Step 8.6 — Register connectors and let snapshot run
+
+```powershell
+# Register source — Debezium will snapshot ALL existing MySQL rows into Kafka
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/source/mysql-cdc-source.json"
+```
+
+Watch logs to confirm snapshot is running:
+
+```powershell
+docker logs kafka-connect --tail 30
+# Look for: "Snapshot step 7 - Snapshotting data"
+# And: "Finished exporting N records for table 'sourcedb.orders'"
+```
+
+Wait for snapshot to complete (~30 seconds for small tables, longer for large tables), then register sink:
+
+```powershell
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/sink/postgres-sink.json"
+```
+
+---
+
+## Step 8.7 — Verify existing data synced
+
+```bash
+# Count rows in MySQL
+mysql -u kafka_user -p'YOUR_PASSWORD' sourcedb -e "SELECT COUNT(*) FROM orders;"
+
+# Count rows in PostgreSQL (should match after sync)
+psql -U kafka_user -d targetdb -c "SELECT COUNT(*) FROM pipeline.orders;"
+```
+
+After the sink processes the snapshot messages from Kafka, the row counts should match.
+
+---
+
+## Step 8.8 — Handle column type mismatches
+
+If the sink fails with a column type error (e.g., MySQL has `DECIMAL(10,2)` but PostgreSQL has `INTEGER`), you have two options:
+
+**Option A — Alter the PostgreSQL column to match MySQL:**
+
+```sql
+-- Run as kafka_user on PostgreSQL
+ALTER TABLE pipeline.orders ALTER COLUMN amount TYPE NUMERIC(10,2);
+```
+
+**Option B — Drop and let Debezium recreate with correct types:**
+
+```sql
+DROP TABLE IF EXISTS pipeline.orders;
+-- Restart the sink connector — it will recreate the table with correct types
+```
+
+> **Note about the `amount` / `DECIMAL` field:** Debezium represents MySQL `DECIMAL` columns as `bytes` (Base64-encoded) in JSON format. In PostgreSQL the value may appear as `"FXw="` instead of `49.99`. This is a known Debezium behavior with JsonConverter. The actual numeric value is stored correctly when using the Debezium JDBC Sink connector — it decodes the bytes. If you query via SQL you will see the correct number.
+
+---
+
+## Step 8.9 — Schema mismatch: existing PostgreSQL table has extra columns
+
+If your existing PostgreSQL table has columns that MySQL doesn't have (e.g., `created_by`, `tenant_id`), the Debezium sink will skip those columns (they keep their existing values or defaults). This is fine — Debezium only manages the columns it knows about from MySQL.
+
+If your existing PostgreSQL table is **missing** columns that MySQL has, Debezium will `ALTER TABLE ADD COLUMN` automatically (this is what `schema.evolution: basic` does).
+
+---
+
+## Summary: Checklist for existing table sync
+
+- [ ] `kafka_user` has `REPLICATION SLAVE` grant on VPS MySQL
+- [ ] VPS MySQL `log_bin = ON` and `binlog_format = ROW`
+- [ ] `pipeline.orders` table owned by `kafka_user` on VPS PostgreSQL
+- [ ] `kafka_user` has `ALL PRIVILEGES ON SCHEMA pipeline`
+- [ ] Source connector registered — snapshot running
+- [ ] Snapshot completed (check `docker logs kafka-connect`)
+- [ ] Sink connector registered — status RUNNING
+- [ ] Row counts match between MySQL and PostgreSQL
+- [ ] Test INSERT in MySQL → appears in PostgreSQL within 5 seconds
+
+---
+
+---
+
+# Phase 9: Full Clean Reset (When Things Go Wrong)
 
 **Use this procedure when:**
 - The Kafka topic has mixed data (from multiple MySQL sources or corrupt messages)
@@ -1901,7 +2108,7 @@ PG_CONFIG = {
 **Option B — VPS PostgreSQL:**
 ```python
 PG_CONFIG = {
-    "host": "YOUR_VPS_IP",
+    "host": "62.171.177.208",
     "port": 5432,
     "dbname": "targetdb",
     "user": "kafka_user",
@@ -2076,8 +2283,8 @@ PG_CONFIG = {
 }
 
 # Option B (VPS — change host and password)
-# MYSQL_CONFIG = {"host": "YOUR_VPS_IP", "port": 3306, ...}
-# PG_CONFIG = {"host": "YOUR_VPS_IP", "port": 5432, ...}
+# MYSQL_CONFIG = {"host": "62.171.177.208", "port": 3306, ...}
+# PG_CONFIG = {"host": "62.171.177.208", "port": 5432, ...}
 
 NUM_ORDERS = 1000
 BATCH_SIZE = 100
@@ -2365,6 +2572,6 @@ docker exec kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list local
 docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group connect-postgres-sink
 
 # Check VPS connectivity
-Test-NetConnection -ComputerName YOUR_VPS_IP -Port 3306
-Test-NetConnection -ComputerName YOUR_VPS_IP -Port 5432
+Test-NetConnection -ComputerName 62.171.177.208 -Port 3306
+Test-NetConnection -ComputerName 62.171.177.208 -Port 5432
 ```
