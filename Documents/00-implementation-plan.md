@@ -2513,6 +2513,759 @@ A healthy pipeline's DLQ should be empty. Messages here indicate records that fa
 
 ---
 
+# Scenario A: MySQL → PostgreSQL
+
+This is the default scenario covered in Phases 1–12. The full setup is documented above.
+
+**Summary:**
+- Source: `io.debezium.connector.mysql.MySqlConnector`
+- Sink: `io.debezium.connector.jdbc.JdbcSinkConnector`
+- MySQL binlog → Kafka → PostgreSQL UPSERT
+- Soft deletes: MySQL DELETE → `__deleted = true` in PostgreSQL
+
+See [connectors/source/mysql-cdc-source.json](../connectors/source/mysql-cdc-source.json) and [connectors/sink/postgres-sink.json](../connectors/sink/postgres-sink.json).
+
+---
+
+---
+
+# Scenario B: PostgreSQL → PostgreSQL
+
+**Use case:** Replicate tables from one PostgreSQL database to another. Example: production PostgreSQL (VPS) → analytics PostgreSQL (Docker or another server).
+
+**How it works:** Debezium reads PostgreSQL's Write-Ahead Log (WAL) via logical replication. Every INSERT, UPDATE, DELETE is captured as a change event and published to Kafka. The JDBC Sink connector then writes those events to the target PostgreSQL.
+
+---
+
+## B.1 — Source PostgreSQL pre-requisites
+
+**Why:** PostgreSQL WAL replication requires `wal_level = logical`. Default is `replica`, which does not expose row-level change data.
+
+**On the SOURCE PostgreSQL (VPS — 62.171.177.208):**
+
+```bash
+# Edit postgresql.conf
+sudo nano /var/lib/pgsql/17/data/postgresql.conf
+```
+
+Set:
+
+```ini
+wal_level = logical
+max_wal_senders = 10
+max_replication_slots = 10
+```
+
+```bash
+sudo systemctl restart postgresql-17
+```
+
+**Create replication user and publication:**
+
+```bash
+sudo -u postgres psql -d sourcedb
+```
+
+```sql
+-- Create a replication user (or grant to existing kafka_user)
+ALTER USER kafka_user REPLICATION;
+
+-- Create a publication — tells PostgreSQL WHICH tables to replicate
+-- Option 1: all tables in a schema
+CREATE PUBLICATION kafka_pub FOR ALL TABLES;
+
+-- Option 2: specific tables only
+CREATE PUBLICATION kafka_pub FOR TABLE public.orders, public.customers;
+
+-- Verify
+SELECT * FROM pg_publication;
+```
+
+---
+
+## B.2 — Create Kafka topics for PostgreSQL source
+
+The topic naming for PostgreSQL CDC is: `{topic.prefix}.{schema}.{table}`
+
+For `public.orders` with prefix `prod.pg`, the topic is `prod.pg.public.orders`.
+
+**Windows PowerShell:**
+
+```powershell
+docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.pg.public.orders --partitions 3 --replication-factor 1 --if-not-exists
+
+docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.pg.public.customers --partitions 3 --replication-factor 1 --if-not-exists
+
+docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.dlq.pg.errors --partitions 1 --replication-factor 1 --config retention.ms=-1 --if-not-exists
+```
+
+**Linux / macOS:**
+
+```bash
+docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.pg.public.orders --partitions 3 --replication-factor 1 --if-not-exists
+docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.pg.public.customers --partitions 3 --replication-factor 1 --if-not-exists
+docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.dlq.pg.errors --partitions 1 --replication-factor 1 --config retention.ms=-1 --if-not-exists
+```
+
+---
+
+## B.3 — Create source connector: `connectors/source/postgres-cdc-source.json`
+
+**Key differences from MySQL source:**
+- `connector.class`: `io.debezium.connector.postgresql.PostgresConnector`
+- `plugin.name`: `pgoutput` — the built-in PostgreSQL logical decoding plugin (no extra install needed for PG 10+)
+- `slot.name`: unique name for the replication slot Debezium creates
+- `publication.name`: must match the publication you created in B.1
+- No `database.server.id` — that's MySQL-only
+
+### Option A — Source is Docker PostgreSQL
+
+```json
+{
+  "name": "pg-cdc-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "kafka_user",
+    "database.password": "kafka_password",
+    "database.dbname": "sourcedb",
+    "database.server.name": "prod.pg",
+
+    "topic.prefix": "prod.pg",
+    "schema.include.list": "public",
+    "table.include.list": "public.orders,public.customers",
+
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_slot",
+    "publication.name": "kafka_pub",
+
+    "snapshot.mode": "initial",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true",
+
+    "transforms": "unwrap,addMetadata",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.add.fields": "op,ts_ms,source.db,source.schema,source.table",
+    "transforms.unwrap.delete.handling.mode": "rewrite",
+    "transforms.unwrap.drop.tombstones": "true",
+
+    "transforms.addMetadata.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.addMetadata.static.field": "_pipeline_version",
+    "transforms.addMetadata.static.value": "1.0",
+
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.deadletterqueue.topic.name": "prod.dlq.pg.errors",
+    "errors.deadletterqueue.topic.replication.factor": "1",
+
+    "heartbeat.interval.ms": "10000"
+  }
+}
+```
+
+### Option B — Source is VPS PostgreSQL (62.171.177.208)
+
+```json
+{
+  "name": "pg-cdc-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "62.171.177.208",
+    "database.port": "5432",
+    "database.user": "kafka_user",
+    "database.password": "YOUR_PASSWORD",
+    "database.dbname": "sourcedb",
+    "database.server.name": "prod.pg",
+
+    "topic.prefix": "prod.pg",
+    "schema.include.list": "public",
+    "table.include.list": "public.orders,public.customers",
+
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_slot",
+    "publication.name": "kafka_pub",
+
+    "snapshot.mode": "initial",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true",
+
+    "transforms": "unwrap,addMetadata",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.add.fields": "op,ts_ms,source.db,source.schema,source.table",
+    "transforms.unwrap.delete.handling.mode": "rewrite",
+    "transforms.unwrap.drop.tombstones": "true",
+
+    "transforms.addMetadata.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.addMetadata.static.field": "_pipeline_version",
+    "transforms.addMetadata.static.value": "1.0",
+
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.deadletterqueue.topic.name": "prod.dlq.pg.errors",
+    "errors.deadletterqueue.topic.replication.factor": "1",
+
+    "heartbeat.interval.ms": "10000"
+  }
+}
+```
+
+Save as: `connectors/source/postgres-cdc-source.json`
+
+---
+
+## B.4 — Create sink connector: `connectors/sink/postgres-pg-sink.json`
+
+**What changes from the MySQL sink:** Only the `topics`, `connection.url`, and the `RegexRouter` pattern (because topic prefix is now `prod.pg.public` instead of `prod.mysql.sourcedb`).
+
+### Option A — Target is Docker PostgreSQL
+
+```json
+{
+  "name": "postgres-pg-sink",
+  "config": {
+    "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+    "tasks.max": "2",
+
+    "connection.url": "jdbc:postgresql://postgres:5432/targetdb",
+    "connection.username": "kafka_user",
+    "connection.password": "kafka_password",
+
+    "topics": "prod.pg.public.orders,prod.pg.public.customers",
+
+    "insert.mode": "upsert",
+    "primary.key.mode": "record_value",
+    "primary.key.fields": "id",
+
+    "schema.evolution": "basic",
+    "table.name.format": "pipeline.${topic}",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true",
+
+    "transforms": "router",
+    "transforms.router.type": "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.router.regex": "prod\\.pg\\.public\\.(.*)",
+    "transforms.router.replacement": "$1",
+
+    "batch.size": "3000",
+    "max.retries": "10",
+    "retry.backoff.ms": "3000",
+
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.deadletterqueue.topic.name": "prod.dlq.pg.errors"
+  }
+}
+```
+
+### Option B — Target is VPS PostgreSQL (62.171.177.208)
+
+Change only:
+
+```json
+"connection.url": "jdbc:postgresql://62.171.177.208:5432/targetdb",
+"connection.username": "kafka_user",
+"connection.password": "YOUR_PASSWORD",
+```
+
+Save as: `connectors/sink/postgres-pg-sink.json`
+
+---
+
+## B.5 — Register and verify
+
+**Windows PowerShell:**
+
+```powershell
+# Register source
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/source/postgres-cdc-source.json"
+
+# Wait 20 seconds for snapshot, then register sink
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/sink/postgres-pg-sink.json"
+
+# Verify both running
+curl.exe http://localhost:8083/connectors/pg-cdc-source/status
+curl.exe http://localhost:8083/connectors/postgres-pg-sink/status
+```
+
+**Linux / macOS:**
+
+```bash
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connectors/source/postgres-cdc-source.json
+
+sleep 20
+
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connectors/sink/postgres-pg-sink.json
+
+curl http://localhost:8083/connectors/pg-cdc-source/status
+curl http://localhost:8083/connectors/postgres-pg-sink/status
+```
+
+---
+
+## B.6 — Common errors (PostgreSQL → PostgreSQL)
+
+**Error: `replication slot "debezium_slot" already exists`**
+- Cause: A previous connector run created the slot and it wasn't cleaned up.
+- Fix:
+  ```sql
+  -- Run on SOURCE PostgreSQL
+  SELECT pg_drop_replication_slot('debezium_slot');
+  ```
+  Then re-register the source connector.
+
+**Error: `publication "kafka_pub" does not exist`**
+- Fix: Create the publication on source PostgreSQL (Step B.1).
+
+**Error: `must be superuser or replication role`**
+- Fix: Grant replication role to `kafka_user`:
+  ```sql
+  ALTER USER kafka_user REPLICATION;
+  ```
+
+**Replication slot fills up disk (production concern)**
+- If the Debezium connector stops for a long time, WAL accumulates for the slot and can fill your disk.
+- Monitor: `SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS lag FROM pg_replication_slots;`
+- If the connector will be down for a long time, drop the slot: `SELECT pg_drop_replication_slot('debezium_slot');`
+
+---
+
+---
+
+# Scenario C: Flat Files (CSV) → PostgreSQL
+
+**Use case:** Load CSV/flat file data into PostgreSQL via Kafka. Example: daily export files from a legacy system, uploaded data files, batch imports.
+
+**How it works:** A Python producer script reads each CSV row and publishes it to a Kafka topic as a JSON message. A separate Python consumer (or JDBC sink) reads from that topic and writes to PostgreSQL.
+
+---
+
+## C.1 — Create Kafka topic for file data
+
+**Windows PowerShell:**
+
+```powershell
+docker exec kafka kafka-topics --create `
+  --bootstrap-server localhost:9092 `
+  --topic prod.files.csv.orders `
+  --partitions 3 `
+  --replication-factor 1 `
+  --if-not-exists
+```
+
+**Linux / macOS:**
+
+```bash
+docker exec kafka kafka-topics --create \
+  --bootstrap-server localhost:9092 \
+  --topic prod.files.csv.orders \
+  --partitions 3 \
+  --replication-factor 1 \
+  --if-not-exists
+```
+
+---
+
+## C.2 — CSV format (expected columns)
+
+Your CSV file should have a header row. Example `data/orders_export.csv`:
+
+```csv
+id,customer_id,product_id,quantity,amount,status,created_at
+1001,5,201,2,49.99,COMPLETED,2024-03-01 10:00:00
+1002,6,202,1,99.00,PENDING,2024-03-01 10:05:00
+1003,7,203,3,29.99,PROCESSING,2024-03-01 10:10:00
+```
+
+---
+
+## C.3 — Create CSV producer: `scripts/csv_to_kafka.py`
+
+**What it does:** Reads each row of the CSV and publishes it as a JSON message to Kafka. Uses the `id` column as the Kafka message key so that upserts work correctly in the sink.
+
+```python
+# scripts/csv_to_kafka.py
+import csv
+import json
+import sys
+from pathlib import Path
+from confluent_kafka import Producer
+
+KAFKA_BOOTSTRAP = "localhost:9092"
+TOPIC = "prod.files.csv.orders"
+
+def delivery_report(err, msg):
+    if err:
+        print(f"[ERROR] Failed to deliver row {msg.key()}: {err}")
+
+def produce_csv(file_path: str):
+    producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
+    file_name = Path(file_path).name
+    row_num = 0
+
+    with open(file_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row_num, row in enumerate(reader, start=1):
+            # Add pipeline metadata
+            row["_source_file"] = file_name
+            row["_row_number"] = str(row_num)
+
+            producer.produce(
+                topic=TOPIC,
+                key=row.get("id", str(row_num)),   # use id as key for deduplication
+                value=json.dumps(row),
+                on_delivery=delivery_report
+            )
+
+            # Flush every 1000 rows to avoid buffer overflow
+            if row_num % 1000 == 0:
+                producer.poll(0)
+                print(f"  Published {row_num} rows...")
+
+    producer.flush()
+    print(f"Done. Published {row_num} rows from '{file_name}' → topic '{TOPIC}'")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python scripts/csv_to_kafka.py <path/to/file.csv>")
+        sys.exit(1)
+    produce_csv(sys.argv[1])
+```
+
+Run:
+
+```bash
+# venv must be activated
+python scripts/csv_to_kafka.py data/orders_export.csv
+```
+
+---
+
+## C.4 — Create PostgreSQL sink connector for CSV topic
+
+**Why use a connector instead of Python consumer?** The JDBC Sink connector handles batching, retries, and schema evolution automatically. For CSV data we use JSON format (no embedded schema), so we use `schemas.enable: false` and rely on `insert.mode: insert`.
+
+> **Note:** For CSV → PostgreSQL via JDBC Sink, the target table must already exist with the correct columns. The connector cannot infer schema from plain JSON (no embedded schema info). Create the table first.
+
+**Create target table on PostgreSQL:**
+
+```sql
+-- Run on target PostgreSQL (Docker or VPS)
+CREATE TABLE IF NOT EXISTS pipeline.csv_orders (
+    id          BIGINT PRIMARY KEY,
+    customer_id BIGINT,
+    product_id  BIGINT,
+    quantity    INT,
+    amount      NUMERIC(10,2),
+    status      VARCHAR(50),
+    created_at  TIMESTAMP,
+    _source_file VARCHAR(255),
+    _row_number  INT,
+    _loaded_at   TIMESTAMP DEFAULT NOW()
+);
+GRANT ALL PRIVILEGES ON pipeline.csv_orders TO kafka_user;
+```
+
+**Create connector: `connectors/sink/csv-postgres-sink.json`**
+
+### Option A — Docker PostgreSQL
+
+```json
+{
+  "name": "csv-postgres-sink",
+  "config": {
+    "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+    "tasks.max": "2",
+
+    "connection.url": "jdbc:postgresql://postgres:5432/targetdb",
+    "connection.username": "kafka_user",
+    "connection.password": "kafka_password",
+
+    "topics": "prod.files.csv.orders",
+
+    "insert.mode": "upsert",
+    "primary.key.mode": "record_value",
+    "primary.key.fields": "id",
+
+    "schema.evolution": "basic",
+    "table.name.format": "pipeline.csv_orders",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    "batch.size": "3000",
+    "max.retries": "10",
+    "retry.backoff.ms": "3000",
+
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.deadletterqueue.topic.name": "prod.dlq.errors"
+  }
+}
+```
+
+### Option B — VPS PostgreSQL
+
+```json
+{
+  "name": "csv-postgres-sink",
+  "config": {
+    "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+    "tasks.max": "2",
+
+    "connection.url": "jdbc:postgresql://62.171.177.208:5432/targetdb",
+    "connection.username": "kafka_user",
+    "connection.password": "YOUR_PASSWORD",
+
+    "topics": "prod.files.csv.orders",
+
+    "insert.mode": "upsert",
+    "primary.key.mode": "record_value",
+    "primary.key.fields": "id",
+
+    "schema.evolution": "basic",
+    "table.name.format": "pipeline.csv_orders",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    "batch.size": "3000",
+    "max.retries": "10",
+    "retry.backoff.ms": "3000",
+
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.deadletterqueue.topic.name": "prod.dlq.errors"
+  }
+}
+```
+
+---
+
+## C.5 — Register the CSV sink connector
+
+**Windows PowerShell:**
+
+```powershell
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/sink/csv-postgres-sink.json"
+
+curl.exe http://localhost:8083/connectors/csv-postgres-sink/status
+```
+
+**Linux / macOS:**
+
+```bash
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connectors/sink/csv-postgres-sink.json
+
+curl http://localhost:8083/connectors/csv-postgres-sink/status
+```
+
+---
+
+## C.6 — Full workflow: Load a CSV file end-to-end
+
+```bash
+# Step 1: Place your CSV in the data/ folder
+mkdir data
+# Copy your CSV file to data/orders_export.csv
+
+# Step 2: Publish CSV rows to Kafka (venv activated)
+python scripts/csv_to_kafka.py data/orders_export.csv
+
+# Step 3: Wait 5 seconds, then verify rows in PostgreSQL
+# Option A (Docker)
+docker exec postgres-target psql -U kafka_user -d targetdb \
+  -c "SELECT COUNT(*) FROM pipeline.csv_orders;"
+
+# Option B (VPS — run on VPS)
+psql -U kafka_user -d targetdb -c "SELECT COUNT(*) FROM pipeline.csv_orders;"
+```
+
+---
+
+## C.7 — Python consumer alternative (hard deletes + custom logic)
+
+If you need custom transformation logic (data cleaning, type conversion, conditional inserts), use the Python consumer instead of the JDBC Sink connector:
+
+```python
+# consumers/csv_consumer.py
+import json
+import psycopg2
+import psycopg2.extras
+import logging
+from confluent_kafka import Consumer, KafkaError
+from decimal import Decimal
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+KAFKA_CONFIG = {
+    "bootstrap.servers": "localhost:9092",
+    "group.id": "csv-pg-consumer",
+    "auto.offset.reset": "earliest",
+    "enable.auto.commit": False,
+}
+
+# Option A (Docker): kafka_password
+# Option B (VPS):    your VPS password
+PG_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "targetdb",
+    "user": "kafka_user",
+    "password": "kafka_password",
+}
+
+TOPIC = "prod.files.csv.orders"
+
+UPSERT_SQL = """
+INSERT INTO pipeline.csv_orders
+    (id, customer_id, product_id, quantity, amount, status, created_at, _source_file)
+VALUES
+    (%(id)s, %(customer_id)s, %(product_id)s, %(quantity)s, %(amount)s,
+     %(status)s, %(created_at)s, %(_source_file)s)
+ON CONFLICT (id) DO UPDATE SET
+    customer_id  = EXCLUDED.customer_id,
+    product_id   = EXCLUDED.product_id,
+    quantity     = EXCLUDED.quantity,
+    amount       = EXCLUDED.amount,
+    status       = EXCLUDED.status;
+"""
+
+def clean_row(row: dict) -> dict:
+    """Convert CSV string values to proper Python types."""
+    return {
+        "id":           int(row.get("id", 0)),
+        "customer_id":  int(row.get("customer_id", 0)),
+        "product_id":   int(row.get("product_id", 0)),
+        "quantity":     int(row.get("quantity", 0)),
+        "amount":       Decimal(row.get("amount", "0")),
+        "status":       row.get("status", "PENDING"),
+        "created_at":   row.get("created_at") or None,
+        "_source_file": row.get("_source_file", ""),
+    }
+
+def main():
+    consumer = Consumer(KAFKA_CONFIG)
+    consumer.subscribe([TOPIC])
+    conn = psycopg2.connect(**PG_CONFIG)
+    batch = []
+    msgs = []
+
+    try:
+        while True:
+            msg = consumer.poll(timeout=2.0)
+            if msg is None:
+                if batch:
+                    with conn.cursor() as cur:
+                        psycopg2.extras.execute_batch(cur, UPSERT_SQL, batch)
+                    conn.commit()
+                    consumer.commit(offsets=msgs)
+                    logger.info(f"Committed {len(batch)} rows")
+                    batch.clear()
+                    msgs.clear()
+                continue
+            if msg.error():
+                if msg.error().code() != KafkaError._PARTITION_EOF:
+                    logger.error(f"Error: {msg.error()}")
+                continue
+
+            row = json.loads(msg.value())
+            batch.append(clean_row(row))
+            msgs.append(msg)
+
+            if len(batch) >= 500:
+                with conn.cursor() as cur:
+                    psycopg2.extras.execute_batch(cur, UPSERT_SQL, batch)
+                conn.commit()
+                consumer.commit(offsets=msgs)
+                logger.info(f"Committed {len(batch)} rows")
+                batch.clear()
+                msgs.clear()
+
+    except KeyboardInterrupt:
+        logger.info("Stopping...")
+    finally:
+        if batch:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(cur, UPSERT_SQL, batch)
+            conn.commit()
+        consumer.close()
+        conn.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+
+```bash
+python consumers/csv_consumer.py
+# Ctrl+C to stop
+```
+
+---
+
+## C.8 — Common errors (CSV → PostgreSQL)
+
+**Error: column `id` does not exist / wrong column type**
+- CSV columns are all strings. Create the PostgreSQL table first with correct types (Step C.4), or use the Python consumer with `clean_row()` (Step C.7) to cast types.
+
+**Error: `duplicate key value violates unique constraint`**
+- Ensure `insert.mode: upsert` and `primary.key.fields: id` are set in the connector.
+
+**CSV has no `id` column**
+- Use a generated key: change the producer to use `key=str(uuid.uuid4())` and set `primary.key.mode: kafka` in the sink connector.
+
+**Large CSV files (100k+ rows) are slow**
+- Increase `batch.size` in the sink connector to `10000`
+- Or use the Python consumer with larger page_size in `execute_batch`
+
+---
+
+---
+
+## Scenario Comparison
+
+| Scenario | Source Connector | Sink | Key Requirement |
+|----------|-----------------|------|----------------|
+| MySQL → PostgreSQL | `MySqlConnector` | JDBC Sink | MySQL binlog ROW format |
+| PostgreSQL → PostgreSQL | `PostgresConnector` | JDBC Sink | `wal_level = logical` + publication |
+| CSV → PostgreSQL | Python producer | JDBC Sink or Python consumer | Target table must exist |
+
+---
+
+---
+
 # Quick Reference
 
 ## All connector REST API commands
