@@ -1388,9 +1388,7 @@ After the connector starts, Debezium takes a snapshot of all existing rows in My
 
 ```bash
 # Check message count in orders topic
-docker exec kafka kafka-run-class kafka.tools.GetOffsetShell \
-  --broker-list localhost:9092 \
-  --topic prod.mysql.sourcedb.orders
+docker exec kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list localhost:9092 --topic prod.mysql.sourcedb.orders
 ```
 
 You should see non-zero offsets (one offset per partition).
@@ -1661,6 +1659,49 @@ docker exec postgres-target psql -U kafka_user -d targetdb \
 **Sink RUNNING but 0 rows in PostgreSQL after switching from Docker to VPS MySQL**
 - Cause: The source connector has stale binlog offsets from Docker MySQL stored in `_connect-offsets`. When it connects to VPS MySQL, it tries to resume from the wrong binlog position and misses all events.
 - Fix: Rename the connector to force a fresh snapshot (see Troubleshooting section).
+
+**Error: `duplicate key value violates unique constraint "pg_type_typname_nsp_index"` — table never created**
+- Cause: PostgreSQL registers a type in `pg_type` when a table is created. If a previous `CREATE TABLE` attempt failed mid-way (e.g., due to a permission error), it leaves behind a dangling type with the table name. On the next attempt the connector tries to create the type again and hits a duplicate key conflict — the table is never created and the connector loops endlessly.
+- Why `schema.evolution: basic` worked before but not now: On a clean first run it works fine. It breaks when a previous failed run already left a dangling type. Each retry makes it worse — the type accumulates but the table is never created.
+- Fix (two steps):
+  1. Drop the dangling types and grant schema permissions on VPS PostgreSQL (as superuser):
+     ```sql
+     -- Run as postgres superuser on VPS
+     DROP TYPE IF EXISTS pipeline.orders CASCADE;
+     DROP TYPE IF EXISTS pipeline.customers CASCADE;
+     GRANT ALL ON SCHEMA pipeline TO kafka_user;
+     ```
+  2. Pre-create the tables manually as `kafka_user` and set `schema.evolution: none` in the connector config to prevent the connector from attempting table creation again:
+     ```sql
+     CREATE TABLE IF NOT EXISTS pipeline.orders (
+       id bigint NOT NULL,
+       customer_id bigint NOT NULL,
+       product_id bigint NOT NULL,
+       quantity integer NOT NULL,
+       amount decimal(10,2) NOT NULL,
+       status text DEFAULT 'PENDING',
+       created_at timestamptz,
+       updated_at timestamptz,
+       __deleted text, __op text, __ts_ms bigint,
+       __source_db text, __source_table text, _pipeline_version text,
+       PRIMARY KEY(id)
+     );
+     CREATE TABLE IF NOT EXISTS pipeline.customers (
+       id bigint NOT NULL PRIMARY KEY,
+       name text, email text,
+       __deleted text, __op text, __ts_ms bigint,
+       __source_db text, __source_table text, _pipeline_version text
+     );
+     GRANT ALL ON pipeline.orders TO kafka_user;
+     GRANT ALL ON pipeline.customers TO kafka_user;
+     ```
+  3. In `connectors/sink/postgres-sink.json` change `"schema.evolution": "basic"` → `"schema.evolution": "none"`.
+  4. Delete the connector, reset consumer group offsets to earliest, and re-register:
+     ```powershell
+     Invoke-WebRequest -Method DELETE -Uri http://localhost:8083/connectors/postgres-sink
+     docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --group connect-postgres-sink --reset-offsets --to-earliest --all-topics --execute
+     curl.exe -X POST http://localhost:8083/connectors -H "Content-Type: application/json" -d "@connectors/sink/postgres-sink.json"
+     ```
 
 ---
 
