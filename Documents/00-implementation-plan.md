@@ -347,7 +347,7 @@ mysql -u root -p
 ```
 
 ```sql
-CREATE USER IF NOT EXISTS 'kafka_user'@'%' IDENTIFIED BY 'YourPassword';
+CREATE USER IF NOT EXISTS 'kafka_user'@'%' IDENTIFIED BY 'ImR$L007';
 GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'kafka_user'@'%';
 CREATE DATABASE IF NOT EXISTS sourcedb;
 GRANT ALL PRIVILEGES ON sourcedb.* TO 'kafka_user'@'%';
@@ -358,10 +358,55 @@ EXIT;
 **Create source tables:**
 
 ```bash
-mysql -u kafka_user -p'YourPassword' sourcedb < scripts/mysql-init.sql
+mysql -u kafka_user -p'ImR$L007' sourcedb < scripts/mysql-init.sql
 ```
 
-> Or paste the SQL directly from Step 4.3 below.
+**Contents of `scripts/mysql-init.sql`:**
+
+```sql
+-- Grant CDC permissions to kafka_user (used by Debezium)
+GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'kafka_user'@'%';
+FLUSH PRIVILEGES;
+
+-- Sample source tables
+CREATE TABLE IF NOT EXISTS orders (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id BIGINT NOT NULL,
+    product_id  BIGINT NOT NULL,
+    quantity    INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    status      VARCHAR(50) DEFAULT 'PENDING',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS customers (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name       VARCHAR(255) NOT NULL,
+    email      VARCHAR(255) UNIQUE NOT NULL,
+    phone      VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert sample data
+INSERT INTO customers (name, email, phone) VALUES
+  ('Alice Johnson', 'alice@example.com', '+1-555-0101'),
+  ('Bob Smith', 'bob@example.com', '+1-555-0102');
+
+INSERT INTO orders (customer_id, product_id, quantity, amount, status) VALUES
+  (1, 101, 2, 49.99, 'COMPLETED'),
+  (2, 102, 1, 99.00, 'PENDING');
+```
+
+**Alternative: Run via DBeaver (if you prefer a GUI instead of command-line):**
+
+1. Open DBeaver → connect to your VPS MySQL (`62.171.177.208:3306`, user `root`)
+2. In the **Database Navigator**, right-click `sourcedb` → **SQL Editor** → **Open SQL Script**
+3. Click the folder icon to open a file, navigate to `scripts/mysql-init.sql`, click **Open**
+4. Press **Ctrl+A** to select all, then press **Ctrl+Enter** (or click the orange ▶ **Execute SQL Script** button)
+5. Verify in DBeaver: expand `sourcedb` → **Tables** → you should see `orders` and `customers` with 2 rows each
+
+> Or paste the SQL directly from the block above into the DBeaver SQL editor and execute.
 
 **Open firewall port 3306:**
 
@@ -429,7 +474,7 @@ sudo systemctl restart postgresql-17
 **Create user, database, schema:**
 
 ```bash
-sudo -u postgres psql -c "CREATE USER kafka_user WITH PASSWORD 'YourPassword';"
+sudo -u postgres psql -c "CREATE USER kafka_user WITH PASSWORD 'ImR\$L007';"
 sudo -u postgres psql -c "CREATE DATABASE targetdb OWNER kafka_user;"
 sudo -u postgres psql -d targetdb -c "CREATE SCHEMA IF NOT EXISTS pipeline AUTHORIZATION kafka_user;"
 sudo -u postgres psql -d targetdb -c "GRANT ALL PRIVILEGES ON SCHEMA pipeline TO kafka_user;"
