@@ -1582,6 +1582,8 @@ curl http://localhost:8083/connectors/postgres-sink/status
 
 Expected: both `connector.state` and all `tasks[*].state` are `RUNNING`.
 
+> **If tasks show `FAILED` with `duplicate key violates pg_type_typname_nsp_index`:** The connector lost its state and tried to recreate an existing table. Drop `pipeline.orders` in PostgreSQL, then restart tasks. See Troubleshooting → *"Sink tasks FAILED with duplicate key value violates unique constraint pg_type_typname_nsp_index"*.
+
 ---
 
 ## Step 7.5 — Verify data synced to PostgreSQL
@@ -2131,6 +2133,69 @@ docker logs kafka-connect --tail 100 2>&1 | Select-String -Pattern "ERROR|WARN|E
 # Linux / macOS
 docker logs kafka-connect --tail 100 2>&1 | grep -i "error\|exception\|failed"
 ```
+
+---
+
+## Sink tasks FAILED with "duplicate key value violates unique constraint pg_type_typname_nsp_index"
+
+**What happened:** Both sink tasks crashed with `FAILED` state and the consumer group state showed `EMPTY` (0 members), causing consumer lag to build up. The error in the task trace was:
+
+```
+Caused by: org.hibernate.exception.ConstraintViolationException: JDBC exception executing SQL
+[CREATE TABLE pipeline.orders (...)]
+[ERROR: duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+  Detail: Key (typname, typnamespace)=(orders, 28827) already exists.]
+```
+
+**Root cause:** The connector's internal state was reset (connector was deleted and recreated, or Kafka Connect restarted without persistent offset storage). It lost the record that `pipeline.orders` already existed and tried to `CREATE TABLE pipeline.orders` again. In PostgreSQL, creating a table also registers a type in the `pg_type` system catalog — so the second `CREATE TABLE` hits a duplicate type constraint.
+
+**How to detect:**
+
+```powershell
+# Check connector and task states
+curl.exe http://localhost:8083/connectors/postgres-sink/status
+# Look for: "state":"FAILED" on tasks and consumer group showing EMPTY/lag building up
+```
+
+**Fix:**
+
+1. Drop the existing target table so the connector can recreate it cleanly:
+
+```python
+# Run from local machine (Python + psycopg2)
+import psycopg2
+conn = psycopg2.connect(host='62.171.177.208', port=5432, dbname='targetdb', user='kafka_user', password='ImR$$L007')
+conn.autocommit = True
+cur = conn.cursor()
+cur.execute('DROP TABLE IF EXISTS pipeline.orders;')
+print('Done:', cur.statusmessage)
+conn.close()
+```
+
+2. Restart the connector tasks:
+
+```bash
+# Linux / macOS / Git Bash
+curl -s -X POST "http://localhost:8083/connectors/postgres-sink/restart?includeTasks=true" \
+  -H "Content-Type: application/json"
+
+# Windows PowerShell (curl is aliased to Invoke-WebRequest — must use Invoke-RestMethod)
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8083/connectors/postgres-sink/restart?includeTasks=true" `
+  -ContentType "application/json"
+```
+
+3. Verify both tasks are `RUNNING` and lag drops back to 0 in Kafka UI.
+
+**Prevention:** Ensure Kafka Connect uses persistent Kafka-backed storage for offsets and config so connector state survives restarts. Verify these environment variables are set in your `docker-compose.yml` for the `kafka-connect` service:
+
+```yaml
+CONNECT_OFFSET_STORAGE_TOPIC: connect-offsets
+CONNECT_CONFIG_STORAGE_TOPIC: connect-configs
+CONNECT_STATUS_STORAGE_TOPIC: connect-status
+```
+
+If these topics persist across restarts, the connector remembers it already created the table and won't attempt `CREATE TABLE` again.
 
 ---
 
