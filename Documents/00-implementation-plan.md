@@ -2147,7 +2147,9 @@ Caused by: org.hibernate.exception.ConstraintViolationException: JDBC exception 
   Detail: Key (typname, typnamespace)=(orders, 28827) already exists.]
 ```
 
-**Root cause:** The connector's internal state was reset (connector was deleted and recreated, or Kafka Connect restarted without persistent offset storage). It lost the record that `pipeline.orders` already existed and tried to `CREATE TABLE pipeline.orders` again. In PostgreSQL, creating a table also registers a type in the `pg_type` system catalog — so the second `CREATE TABLE` hits a duplicate type constraint.
+**Root cause:** The connector was **deleted and re-registered** (`DELETE /connectors/postgres-sink` followed by `POST /connectors`). Deleting a connector intentionally wipes its config and consumer group offsets from the Kafka Connect storage topics (`_connect-configs`, `_connect-offsets`). The new connector has zero knowledge of prior runs — no record that `pipeline.orders` was ever created — so it attempts `CREATE TABLE pipeline.orders` again. In PostgreSQL, creating a table also registers a type in the `pg_type` system catalog, so the second `CREATE TABLE` hits a duplicate type constraint.
+
+> **Note:** This is NOT caused by `docker compose down/up`. The Kafka Connect storage topics (`_connect-offsets`, `_connect-configs`, `_connect-status`) persist connector state across container restarts. The state is only lost when you explicitly `DELETE` the connector via the API.
 
 **How to detect:**
 
@@ -2187,15 +2189,18 @@ Invoke-RestMethod -Method Post `
 
 3. Verify both tasks are `RUNNING` and lag drops back to 0 in Kafka UI.
 
-**Prevention:** Ensure Kafka Connect uses persistent Kafka-backed storage for offsets and config so connector state survives restarts. Verify these environment variables are set in your `docker-compose.yml` for the `kafka-connect` service:
+**Prevention:** Never `DELETE` a connector and re-register it unless you also intend to drop and recreate the target tables. When a connector fails, always prefer restarting tasks over deleting:
 
-```yaml
-CONNECT_OFFSET_STORAGE_TOPIC: connect-offsets
-CONNECT_CONFIG_STORAGE_TOPIC: connect-configs
-CONNECT_STATUS_STORAGE_TOPIC: connect-status
+```powershell
+# PREFERRED — restart only, preserves offset state and table knowledge
+# Windows PowerShell (curl is aliased to Invoke-WebRequest — use curl.exe for real curl)
+curl.exe -s -X POST "http://localhost:8083/connectors/postgres-sink/restart?includeTasks=true" -H "Content-Type: application/json"
+
+# Linux / macOS / Git Bash
+curl -s -X POST "http://localhost:8083/connectors/postgres-sink/restart?includeTasks=true" -H "Content-Type: application/json"
 ```
 
-If these topics persist across restarts, the connector remembers it already created the table and won't attempt `CREATE TABLE` again.
+Only use `DELETE /connectors/postgres-sink` when doing a full clean reset — and in that case, also drop `pipeline.orders` and `pipeline.customers` in PostgreSQL before re-registering.
 
 ---
 
