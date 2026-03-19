@@ -261,10 +261,8 @@ mysql -u root -p -e "SHOW VARIABLES LIKE 'log_bin'; SHOW VARIABLES LIKE 'binlog_
 Expected: `log_bin = ON` and `binlog_format = ROW`. If not, configure it:
 
 ```bash
-# AlmaLinux 9 / CentOS — edit MySQL config
+# AlmaLinux 9 — MySQL config path
 sudo nano /etc/my.cnf
-# OR if using MySQL 8 on AlmaLinux:
-sudo nano /etc/mysql/mysql.conf.d/mysqld.cnf
 ```
 
 Add or update these lines under `[mysqld]`:
@@ -326,7 +324,7 @@ sudo ufw allow 3306/tcp
 
 ```bash
 # Make sure MySQL listens on all interfaces, not just 127.0.0.1
-grep bind-address /etc/mysql/mysql.conf.d/mysqld.cnf
+grep bind-address /etc/my.cnf
 # If it shows 127.0.0.1, change to:
 # bind-address = 0.0.0.0
 sudo systemctl restart mysqld
@@ -344,11 +342,9 @@ Test-NetConnection -ComputerName YOUR_VPS_IP -Port 3306
 ## Step 3.2 — Configure VPS PostgreSQL for CDC sink
 
 ```bash
-# Find your postgresql.conf
-sudo find /etc -name postgresql.conf 2>/dev/null
-
-# Edit it (path varies by OS/version)
-sudo nano /etc/postgresql/15/main/postgresql.conf
+# AlmaLinux 9 — PostgreSQL 17 paths
+# Data directory: /var/lib/pgsql/17/data/
+sudo nano /var/lib/pgsql/17/data/postgresql.conf
 ```
 
 Set:
@@ -362,7 +358,7 @@ listen_addresses = '*'
 
 ```bash
 # Edit pg_hba.conf to allow remote connections
-sudo nano /etc/postgresql/15/main/pg_hba.conf
+sudo nano /var/lib/pgsql/17/data/pg_hba.conf
 ```
 
 Add this line (allows all users from any IP with password auth):
@@ -372,7 +368,8 @@ host    all    all    0.0.0.0/0    md5
 ```
 
 ```bash
-sudo systemctl restart postgresql
+# AlmaLinux 9 — PostgreSQL 17 service name
+sudo systemctl restart postgresql-17
 ```
 
 **Create user, database, schema:**
