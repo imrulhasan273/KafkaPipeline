@@ -1,261 +1,358 @@
-# Kafka Pipeline — Implementation Plan
+# Kafka Pipeline — Complete Implementation Guide
 
-**Target audience:** Developer starting from scratch on Windows 11 with Python 3.13, Docker Desktop 29.2.1, Docker Compose v5.1.0, and a venv already set up.
+**For:** A developer starting from scratch who wants to build a production-grade MySQL → Kafka → PostgreSQL CDC pipeline.
 
-**Goal:** A fully working MySQL → Kafka → PostgreSQL CDC pipeline with monitoring, running locally in Docker.
+**Environments covered:** Windows 11 (PowerShell), Linux AlmaLinux 9, macOS Apple Silicon (M1/M2/M3)
 
-**Duration:** 4 days (split across 8 phases)
+**Database options:**
+- **Option A — Docker:** MySQL and PostgreSQL run as Docker containers (best for local dev and learning)
+- **Option B — VPS/External:** MySQL and PostgreSQL run on a remote Linux server (production-like)
 
----
-
-## Prerequisites Checklist
-
-Before you begin, confirm the following:
-
-- [ ] Python 3.13 installed (`python --version`)
-- [ ] Docker Desktop 29.2.1 running (`docker --version`)
-- [ ] Docker Compose v5.1.0 available (`docker compose version`)
-- [ ] A Python venv already created for this project
-- [ ] At least **8 GB free RAM** and **10 GB free disk** for Docker containers
+**Stack versions (tested and working):**
+- Apache Kafka `7.6.1` (KRaft mode — no Zookeeper needed)
+- Debezium Connect `2.6` (includes both MySQL source + JDBC sink connectors)
+- Schema Registry `7.6.1`
+- Kafka UI (provectuslabs) — latest
+- Python 3.13
 
 ---
 
-## Architecture Overview
+## What This Pipeline Does
 
 ```
-MySQL (source)
-    │  binlog (ROW format)
+MySQL (source database)
+    │
+    │  Reads binlog (Change Data Capture)
     ▼
-Debezium MySQL Source Connector  (inside Kafka Connect)
-    │  Avro records
+Debezium MySQL Source Connector  ← runs inside Kafka Connect
+    │
+    │  Publishes JSON messages with schema
     ▼
-Kafka Cluster  +  Schema Registry
-    │  Avro records
+Apache Kafka  (topics: prod.mysql.sourcedb.orders, prod.mysql.sourcedb.customers)
+    │
+    │  Reads messages
     ▼
-JDBC Sink Connector  (inside Kafka Connect)
-    │  JDBC
+Debezium JDBC Sink Connector  ← runs inside Kafka Connect
+    │
+    │  JDBC UPSERT
     ▼
-PostgreSQL (target)
+PostgreSQL (target database)
 
-Monitoring: Prometheus + Grafana + Kafka UI + Kafka Exporter
+Monitoring: Prometheus + Grafana + Kafka Exporter + Kafka UI
+```
+
+**What CDC means:** Instead of running periodic queries (`SELECT * WHERE updated_at > last_run`), Debezium reads MySQL's binary log (binlog) in real-time. Every INSERT, UPDATE, and DELETE in MySQL is captured as an event and published to Kafka within milliseconds. This is how banking systems, e-commerce platforms, and analytics pipelines work at scale.
+
+---
+
+## Port Map
+
+| Service | Host Port | Container Port | URL |
+|---------|-----------|---------------|-----|
+| Kafka broker | 9092 | 9092 | (no HTTP) |
+| Kafka controller | 9093 | 9093 | (internal only) |
+| Kafka JMX | 7071 | 7071 | (metrics) |
+| Schema Registry | 8081 | 8081 | http://localhost:8081 |
+| Kafka Connect | 8083 | 8083 | http://localhost:8083 |
+| Kafka UI | **8090** | 8080 | http://localhost:8090 |
+| Prometheus | 9090 | 9090 | http://localhost:9090 |
+| Grafana | 3000 | 3000 | http://localhost:3000 |
+| Kafka Exporter | 9308 | 9308 | http://localhost:9308/metrics |
+| MySQL (Docker) | **3307** | 3306 | localhost:3307 |
+| PostgreSQL (Docker) | 5432 | 5432 | localhost:5432 |
+
+> **Why 8090 for Kafka UI?** Port 8080 is commonly used by local development servers (Tomcat, Spring Boot, etc.). Using 8090 avoids conflicts.
+>
+> **Why 3307 for MySQL?** Port 3306 may already be used by a local MySQL installation on Windows. Using 3307 as the host port avoids the `bind: address already in use` error.
+
+---
+
+## System Requirements
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| RAM | 6 GB free for Docker | 8 GB |
+| Disk | 8 GB free | 15 GB |
+| Docker Desktop | 29.x | 29.2.1+ |
+| Docker Compose | v5.x | v5.1.0+ |
+| Python | 3.11+ | 3.13 |
+
+---
+
+---
+
+# Phase 1: System Prerequisites
+
+---
+
+## Step 1.1 — Install Docker Desktop
+
+**Why:** All Kafka infrastructure (broker, connect, schema registry, monitoring) runs in Docker containers. Docker Desktop provides the container runtime on Windows and Mac.
+
+**Windows / Mac:**
+- Download from https://www.docker.com/products/docker-desktop/
+- Install and launch it
+- Go to **Settings → Resources → Memory** and set to **8 GB minimum**
+
+**Linux (AlmaLinux 9):**
+
+```bash
+sudo dnf install -y yum-utils
+sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+Verify:
+
+```bash
+docker --version         # Docker version 29.x.x
+docker compose version   # Docker Compose version v5.x.x
 ```
 
 ---
 
-## Port Map (Quick Reference)
+## Step 1.2 — Create Python virtual environment
 
-### Docker services (always local)
-| Service | Port | URL |
-|---------|------|-----|
-| Kafka (broker) | 9092 | — |
-| Schema Registry | 8081 | http://localhost:8081 |
-| Kafka Connect | 8083 | http://localhost:8083 |
-| Kafka UI | 8090 | http://localhost:8090 |
-| Prometheus | 9090 | http://localhost:9090 |
-| Grafana | 3000 | http://localhost:3000 |
-| Kafka Exporter | 9308 | http://localhost:9308/metrics |
+**Why:** Python dependencies (kafka client, psycopg2, mysql connector) should be isolated in a venv so they don't conflict with other projects on your machine.
 
-### Database ports (depends on your option)
-| Service | Option A (Docker) | Option B (VPS) |
-|---------|------------------|----------------|
-| MySQL | `localhost:3307` | `62.171.177.208:3306` |
-| PostgreSQL | `localhost:5432` | `62.171.177.208:5432` |
-
----
-
----
-
-# Phase 1: Project Setup (Day 1)
-
-**Time estimate:** 20–30 minutes
-
----
-
-## Step 1.1 — Create the folder structure
-
-Open PowerShell (or Git Bash) in the directory where you want to create the project.
+**Windows PowerShell:**
 
 ```powershell
-# Create project root and all subdirectories in one shot
-mkdir kafka-pipeline
-cd kafka-pipeline
+# Navigate to your project folder first
+cd D:\Personal\Project\KafkaPipeline
 
-mkdir connectors\source
-mkdir connectors\sink
-mkdir scripts
-mkdir monitoring\grafana\dashboards
-mkdir config
-```
+# Create venv
+python -m venv venv
 
-Verify the structure:
-
-```powershell
-# PowerShell tree
-Get-ChildItem -Recurse -Directory | Select-Object FullName
-```
-
-Expected layout:
-
-```
-kafka-pipeline/
-├── connectors/
-│   ├── source/
-│   └── sink/
-├── scripts/
-├── monitoring/
-│   └── grafana/
-│       └── dashboards/
-└── config/
-```
-
-- [ ] Folder structure created
-
----
-
-## Step 1.2 — Activate your venv
-
-```powershell
-# Windows PowerShell — assuming venv is named .venv at project root
-.\.venv\Scripts\Activate.ps1
-
-# Or if you named it venv
+# Activate it
 .\venv\Scripts\Activate.ps1
 
-# Git Bash alternative
-source .venv/Scripts/activate
+# If you get a script execution policy error:
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+.\venv\Scripts\Activate.ps1
 ```
 
-Your prompt should now show `(.venv)` at the start.
+**Linux (AlmaLinux 9):**
 
-- [ ] venv activated
+```bash
+cd ~/kafka-pipeline
+python3 -m venv venv
+source venv/bin/activate
+```
+
+**macOS (M1/M2/M3):**
+
+```bash
+cd ~/kafka-pipeline
+python3 -m venv venv
+source venv/bin/activate
+```
+
+Your prompt should now show `(venv)` at the start.
+
+Verify Python:
+
+```bash
+python --version    # should show 3.11+ or 3.13
+```
 
 ---
 
 ## Step 1.3 — Install Python dependencies
 
-```powershell
+**Why:** `confluent-kafka` is the official Kafka client library for Python. `psycopg2-binary` lets Python connect to PostgreSQL. `mysql-connector-python` lets Python connect to MySQL.
+
+**All platforms (run with venv activated):**
+
+```bash
 pip install confluent-kafka psycopg2-binary mysql-connector-python
 pip freeze > requirements.txt
 ```
 
-- [ ] Python dependencies installed
-
----
-
-## Step 1.4 — Create `requirements.txt` (if not using pip freeze)
-
-If you prefer to write it manually:
-
-```
-confluent-kafka==2.4.0
-psycopg2-binary==2.9.9
-mysql-connector-python==8.3.0
-```
-
----
-
-## Phase 1 — Verification
-
-- [ ] `kafka-pipeline/` directory exists with the correct sub-folders
-- [ ] `(.venv)` appears in your shell prompt
-- [ ] `python -c "import confluent_kafka; print('OK')"` prints `OK`
-
----
-
----
-
-# Phase 2: Docker Infrastructure (Day 1)
-
-**Time estimate:** 30–45 minutes (plus image download time, ~15 min on first run)
-
----
-
-## Step 2.1 — Choose your Database Option
-
-Before creating `docker-compose.yml`, decide where your MySQL and PostgreSQL will run:
-
-| Option | MySQL/PG location | Best for |
-|--------|------------------|----------|
-| **Option A: Docker** | Runs as Docker containers | Local dev, clean environment, no existing DB |
-| **Option B: VPS / External** | Runs on your Linux VPS or remote server | You already have a running DB, production-like setup |
-
----
-
-### Option B Pre-requisites — VPS Database Setup
-
-> **Do this BEFORE creating docker-compose.yml if using Option B.**
-
-#### MySQL on VPS — Required configuration
-
-SSH into your VPS and run:
+Verify:
 
 ```bash
-# 1. Check binlog is enabled
-mysql -u root -p -e "SHOW VARIABLES LIKE 'log_bin';"
-# Must show: log_bin = ON
-
-mysql -u root -p -e "SHOW VARIABLES LIKE 'binlog_format';"
-# Must show: binlog_format = ROW
+python -c "import confluent_kafka; print('confluent_kafka OK')"
+python -c "import psycopg2; print('psycopg2 OK')"
+python -c "import mysql.connector; print('mysql.connector OK')"
 ```
 
-If binlog is OFF, edit `/etc/mysql/mysql.conf.d/mysqld.cnf` (Ubuntu) or `/etc/my.cnf` (CentOS):
+---
+
+---
+
+# Phase 2: Project Folder Structure
+
+---
+
+## Step 2.1 — Create the folder layout
+
+**Why:** Keeping connectors, scripts, and monitoring configs in separate folders makes the project navigable and lets Docker Compose mount specific directories cleanly.
+
+**Windows PowerShell:**
+
+```powershell
+mkdir connectors\source
+mkdir connectors\sink
+mkdir scripts
+mkdir monitoring\grafana\dashboards
+mkdir config
+mkdir consumers
+```
+
+**Linux / macOS:**
+
+```bash
+mkdir -p connectors/source connectors/sink scripts monitoring/grafana/dashboards config consumers
+```
+
+Expected structure:
+
+```
+kafka-pipeline/
+├── connectors/
+│   ├── source/         ← source connector JSON configs
+│   └── sink/           ← sink connector JSON configs
+├── scripts/            ← SQL init files, Python scripts
+├── consumers/          ← Python consumer scripts
+├── monitoring/
+│   ├── prometheus.yml
+│   └── grafana/
+│       └── dashboards/
+├── config/
+├── docker-compose.yml
+└── requirements.txt
+```
+
+---
+
+---
+
+# Phase 3: VPS Pre-requisites (Option B Only)
+
+> **Skip this entire phase if you are using Option A (Docker databases).**
+> Only read this if you want MySQL and/or PostgreSQL to run on a remote VPS.
+
+---
+
+## Why VPS requires pre-configuration
+
+Docker MySQL comes pre-configured with binlog enabled (via the `--log-bin` command in docker-compose). A VPS MySQL installed via `apt` or `dnf` does NOT have binlog enabled by default. Similarly, VPS PostgreSQL needs `wal_level = logical` for replication. These must be set before Debezium can capture changes.
+
+---
+
+## Step 3.1 — Configure VPS MySQL for CDC
+
+SSH into your VPS:
+
+```bash
+ssh root@YOUR_VPS_IP
+```
+
+**Check if binlog is already enabled:**
+
+```bash
+mysql -u root -p -e "SHOW VARIABLES LIKE 'log_bin'; SHOW VARIABLES LIKE 'binlog_format';"
+```
+
+Expected: `log_bin = ON` and `binlog_format = ROW`. If not, configure it:
+
+```bash
+# AlmaLinux 9 / CentOS — edit MySQL config
+sudo nano /etc/my.cnf
+# OR if using MySQL 8 on AlmaLinux:
+sudo nano /etc/mysql/mysql.conf.d/mysqld.cnf
+```
+
+Add or update these lines under `[mysqld]`:
 
 ```ini
 [mysqld]
-server-id         = 1
-log_bin           = mysql-bin
-binlog_format     = ROW
-binlog_row_image  = FULL
-gtid_mode         = ON
-enforce_gtid_consistency = ON
+server-id              = 1
+log_bin                = mysql-bin
+binlog_format          = ROW
+binlog_row_image       = FULL
+expire_logs_days       = 7
 ```
 
-Then restart MySQL:
+Restart MySQL:
+
 ```bash
+# AlmaLinux 9
+sudo systemctl restart mysqld
+
+# Ubuntu/Debian
 sudo systemctl restart mysql
 ```
 
+**Create `kafka_user` with CDC permissions:**
+
 ```bash
-# 2. Create user and grant CDC permissions
-mysql -u root -p -e "
-CREATE USER IF NOT EXISTS 'kafka_user'@'%' IDENTIFIED BY 'ImR$$L007';
+mysql -u root -p
+```
+
+```sql
+CREATE USER IF NOT EXISTS 'kafka_user'@'%' IDENTIFIED BY 'YourPassword';
 GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'kafka_user'@'%';
+CREATE DATABASE IF NOT EXISTS sourcedb;
 GRANT ALL PRIVILEGES ON sourcedb.* TO 'kafka_user'@'%';
 FLUSH PRIVILEGES;
-"
-
-# 3. Create source database and tables
-mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS sourcedb;"
-
-# Run mysql-init.sql ON THE VPS (copy the file to VPS first or paste contents)
-mysql -u kafka_user -p'ImR$$L007' sourcedb < scripts/mysql-init.sql
+EXIT;
 ```
 
-> **Note:** The `mysql-init.sql` file creates the `orders` and `customers` tables and inserts sample data. Run it on your VPS MySQL so the source tables exist before registering the CDC connector.
+**Create source tables:**
 
 ```bash
-# 4. Allow remote connections — open port 3306 in firewall
-sudo ufw allow 3306/tcp       # Ubuntu UFW
-# OR
-sudo firewall-cmd --permanent --add-port=3306/tcp && sudo firewall-cmd --reload  # CentOS firewalld
+mysql -u kafka_user -p'YourPassword' sourcedb < scripts/mysql-init.sql
 ```
 
-Also check MySQL bind-address in config — must NOT be `127.0.0.1`:
-```ini
-# /etc/mysql/mysql.conf.d/mysqld.cnf
-bind-address = 0.0.0.0   # allow connections from all IPs
+> Or paste the SQL directly from Step 4.3 below.
+
+**Open firewall port 3306:**
+
+```bash
+# AlmaLinux 9 (firewalld)
+sudo firewall-cmd --permanent --add-port=3306/tcp
+sudo firewall-cmd --reload
+
+# Ubuntu (ufw)
+sudo ufw allow 3306/tcp
+```
+
+**Allow remote connections (check bind-address):**
+
+```bash
+# Make sure MySQL listens on all interfaces, not just 127.0.0.1
+grep bind-address /etc/mysql/mysql.conf.d/mysqld.cnf
+# If it shows 127.0.0.1, change to:
+# bind-address = 0.0.0.0
+sudo systemctl restart mysqld
+```
+
+**Verify from Windows:**
+
+```powershell
+Test-NetConnection -ComputerName YOUR_VPS_IP -Port 3306
+# TcpTestSucceeded: True = reachable
 ```
 
 ---
 
-#### PostgreSQL on VPS — Required configuration
+## Step 3.2 — Configure VPS PostgreSQL for CDC sink
 
 ```bash
-# 1. Edit postgresql.conf — enable logical replication
-sudo nano /etc/postgresql/*/main/postgresql.conf
+# Find your postgresql.conf
+sudo find /etc -name postgresql.conf 2>/dev/null
+
+# Edit it (path varies by OS/version)
+sudo nano /etc/postgresql/15/main/postgresql.conf
 ```
 
-Set these values:
+Set:
+
 ```ini
 wal_level = logical
 max_wal_senders = 10
@@ -264,75 +361,169 @@ listen_addresses = '*'
 ```
 
 ```bash
-# 2. Edit pg_hba.conf — allow remote connections
-sudo nano /etc/postgresql/*/main/pg_hba.conf
+# Edit pg_hba.conf to allow remote connections
+sudo nano /etc/postgresql/15/main/pg_hba.conf
 ```
 
-Add this line:
+Add this line (allows all users from any IP with password auth):
+
 ```
 host    all    all    0.0.0.0/0    md5
 ```
 
 ```bash
-# 3. Restart PostgreSQL
 sudo systemctl restart postgresql
+```
 
-# 4. Create user, database, schema, and target tables
-sudo -u postgres psql -c "CREATE USER kafka_user WITH PASSWORD 'ImR\$\$L007';"
+**Create user, database, schema:**
+
+```bash
+sudo -u postgres psql -c "CREATE USER kafka_user WITH PASSWORD 'YourPassword';"
 sudo -u postgres psql -c "CREATE DATABASE targetdb OWNER kafka_user;"
 sudo -u postgres psql -d targetdb -c "CREATE SCHEMA IF NOT EXISTS pipeline AUTHORIZATION kafka_user;"
 sudo -u postgres psql -d targetdb -c "GRANT ALL PRIVILEGES ON SCHEMA pipeline TO kafka_user;"
+```
 
-# 5. Run postgres-init.sql ON THE VPS to create target tables
-# Copy scripts/postgres-init.sql to VPS first, then run:
-sudo -u postgres psql -d targetdb < scripts/postgres-init.sql
+> **CRITICAL NOTE — Table ownership:** The tables in the `pipeline` schema MUST be owned by `kafka_user`. If they are created by the `postgres` superuser, the Debezium JDBC Sink connector will fail with `ERROR: must be owner of table orders` when it tries to add CDC columns via `ALTER TABLE`. Either:
+> - Let the Debezium sink create the tables automatically (recommended — `schema.evolution: basic` handles this)
+> - Or create them manually while connected as `kafka_user`
+>
+> If you created tables as `postgres` and see the ownership error, drop them and let the sink recreate:
+> ```sql
+> DROP TABLE IF EXISTS pipeline.orders;
+> DROP TABLE IF EXISTS pipeline.customers;
+> ```
 
-# OR paste directly:
-sudo -u postgres psql -d targetdb -c "
-CREATE TABLE IF NOT EXISTS pipeline.orders (
-    id           BIGINT PRIMARY KEY,
-    customer_id  BIGINT,
-    product_id   BIGINT,
-    quantity     INT,
-    amount       NUMERIC(10,2),
-    status       VARCHAR(50),
-    created_at   TIMESTAMP,
-    updated_at   TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS pipeline.customers (
-    id           BIGINT PRIMARY KEY,
-    name         VARCHAR(255),
-    email        VARCHAR(255),
-    phone        VARCHAR(50),
-    created_at   TIMESTAMP
-);
-"
+**Open firewall port 5432:**
 
-# 6. Open port 5432 in firewall
+```bash
+# AlmaLinux 9
+sudo firewall-cmd --permanent --add-port=5432/tcp
+sudo firewall-cmd --reload
+
+# Ubuntu
 sudo ufw allow 5432/tcp
 ```
 
-> **Note:** The Debezium JDBC sink connector with `schema.evolution: basic` will auto-create and evolve the tables. Running `postgres-init.sql` manually is optional — but recommended so you have the correct schema ready before data flows in.
+**Verify from Windows:**
 
-```bash
-# 7. Verify connection from your Windows machine (run in PowerShell)
-Test-NetConnection -ComputerName 62.171.177.208 -Port 3306
-Test-NetConnection -ComputerName 62.171.177.208 -Port 5432
+```powershell
+Test-NetConnection -ComputerName YOUR_VPS_IP -Port 5432
 # TcpTestSucceeded: True = reachable
 ```
 
 ---
 
-## Step 2.1 — Create `docker-compose.yml`
+---
 
-Create `kafka-pipeline/docker-compose.yml` with the following content.
+# Phase 4: Docker Infrastructure
 
-**Important notes for Docker 29.x:**
-- No `version:` field — it is deprecated and causes a warning on Docker Compose v5.x
-- Uses `KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"` for inter-container communication. The `kafka-ui` and connector containers reference `kafka:9092`, not `localhost:9092`.
-- Healthchecks ensure services start in the correct order.
+---
 
-**Choose the block that matches your Option (A or B) below.**
+## Step 4.1 — Create `scripts/mysql-init.sql`
+
+**Why:** When the Docker MySQL container starts for the first time, it automatically runs any `.sql` files in `/docker-entrypoint-initdb.d/`. This script creates the source tables and grants CDC permissions to `kafka_user`. Without the REPLICATION SLAVE grant, Debezium cannot read the binlog.
+
+```sql
+-- Grant CDC permissions to kafka_user (used by Debezium to read binlog)
+-- REPLICATION SLAVE and REPLICATION CLIENT are the key permissions
+GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'kafka_user'@'%';
+FLUSH PRIVILEGES;
+
+-- Source tables
+CREATE TABLE IF NOT EXISTS orders (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id BIGINT NOT NULL,
+    product_id  BIGINT NOT NULL,
+    quantity    INT NOT NULL,
+    amount      DECIMAL(10,2) NOT NULL,
+    status      VARCHAR(50) DEFAULT 'PENDING',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS customers (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name       VARCHAR(255) NOT NULL,
+    email      VARCHAR(255) UNIQUE NOT NULL,
+    phone      VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Sample data so the initial snapshot has something to capture
+INSERT INTO customers (name, email, phone) VALUES
+  ('Alice Johnson', 'alice@example.com', '+1-555-0101'),
+  ('Bob Smith',     'bob@example.com',   '+1-555-0102');
+
+INSERT INTO orders (customer_id, product_id, quantity, amount, status) VALUES
+  (1, 101, 2, 49.99, 'COMPLETED'),
+  (2, 102, 1, 99.00, 'PENDING');
+```
+
+Save as: `scripts/mysql-init.sql`
+
+---
+
+## Step 4.2 — Create `scripts/postgres-init.sql`
+
+**Why:** This script runs automatically when the Docker PostgreSQL container starts. It creates the `pipeline` schema where Debezium will write synced data.
+
+> **Important:** Do NOT create the `pipeline.orders` and `pipeline.customers` tables manually here with extra columns like `_cdc_op` or `_ingested_at`. If you do, the Debezium JDBC Sink connector will try to `ALTER TABLE` to add its own CDC columns and will fail if the existing columns conflict. Let Debezium auto-create the tables via `schema.evolution: basic`.
+
+```sql
+-- Grant schema permissions to kafka_user
+GRANT ALL PRIVILEGES ON DATABASE targetdb TO kafka_user;
+
+-- Create target schema — Debezium will create tables automatically inside this schema
+CREATE SCHEMA IF NOT EXISTS pipeline;
+GRANT ALL PRIVILEGES ON SCHEMA pipeline TO kafka_user;
+```
+
+Save as: `scripts/postgres-init.sql`
+
+---
+
+## Step 4.3 — Create `monitoring/prometheus.yml`
+
+**Why:** Prometheus needs a config file telling it where to scrape metrics from. Without this file, the Prometheus container will fail to start with a "file not found" mount error.
+
+> **Note:** The `kafka-connect:7072` target will show as DOWN — this is expected. The `debezium/connect:2.6` image does not expose a Prometheus endpoint on port 7072. Use `kafka-exporter:9308` for consumer lag metrics instead (that target will be UP).
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "kafka-exporter"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  - job_name: "kafka-connect"
+    static_configs:
+      - targets: ["kafka-connect:7072"]
+    metrics_path: /metrics
+```
+
+Save as: `monitoring/prometheus.yml`
+
+---
+
+## Step 4.4 — Create `docker-compose.yml`
+
+**Why this file matters:** This is the master file that defines all 9 containers, their dependencies, ports, environment variables, and health checks. Docker Compose reads it and orchestrates everything.
+
+**Critical notes for Docker 29.x / Compose v5.x:**
+- **No `version:` field** — the `version: "3.9"` field is deprecated in Compose v5.x and causes a warning. Remove it entirely.
+- **`kafka` service name is used as hostname** — inside the Docker network, all containers reference Kafka as `kafka:9092`. Your Windows machine accesses it as `localhost:9092`.
+- **`JsonConverter` not `AvroConverter`** — the `debezium/connect:2.6` image does NOT include Confluent Avro serializer JARs. Using `AvroConverter` causes `ClassNotFoundException`. Use `JsonConverter` throughout.
+- **Healthchecks** — `kafka-connect` waits for `kafka` to be healthy before starting, and `kafka-exporter` does the same. Without `condition: service_healthy`, the exporter starts before Kafka is ready and crashes.
+
+---
+
+### Option A — Docker databases (MySQL + PostgreSQL as containers)
+
+Use this if you want everything local, no external server needed.
 
 ```yaml
 services:
@@ -421,9 +612,6 @@ services:
       KEY_CONVERTER_SCHEMAS_ENABLE: "false"
       VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
       CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
-      CONNECT_PLUGIN_PATH: "/kafka/connect,/usr/share/confluent-hub-components"
-    volumes:
-      - ./connectors:/kafka/connect/custom
     healthcheck:
       test: curl -f http://localhost:8083/ || exit 1
       interval: 30s
@@ -527,10 +715,9 @@ volumes:
 
 ---
 
-### Option B: docker-compose.yml (VPS databases — no MySQL/PostgreSQL containers)
+### Option B — VPS databases (no MySQL/PostgreSQL containers)
 
-> Use this if your MySQL and PostgreSQL are running on a VPS or remote server.
-> Remove the `mysql` and `postgres` service blocks. Everything else stays the same.
+Use this if MySQL and PostgreSQL are on a remote VPS. Remove the `mysql` and `postgres` service blocks and update the volumes section.
 
 ```yaml
 services:
@@ -619,9 +806,6 @@ services:
       KEY_CONVERTER_SCHEMAS_ENABLE: "false"
       VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
       CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
-      CONNECT_PLUGIN_PATH: "/kafka/connect,/usr/share/confluent-hub-components"
-    volumes:
-      - ./connectors:/kafka/connect/custom
     healthcheck:
       test: curl -f http://localhost:8083/ || exit 1
       interval: 30s
@@ -683,374 +867,248 @@ volumes:
   grafana-data:
 ```
 
-> **After using Option B docker-compose.yml**, skip Steps 2.2 (mysql-init.sql) and 2.3 (postgres-init.sql) — those only apply to Docker databases. Your VPS databases are already configured from the pre-requisites above.
-
 ---
 
-- [ ] `docker-compose.yml` created
+## Step 4.5 — Pull Docker images (optional but recommended on slow connections)
 
----
+**Why:** Pulling images one at a time is more stable on slower connections. If a pull fails mid-way, you can retry just that image. `docker compose up` will also pull missing images, but one failure aborts everything.
 
-## Step 2.2 — Create `scripts/mysql-init.sql`
+**Windows PowerShell / Linux / macOS:**
 
-This runs automatically when the MySQL container first starts. It grants CDC permissions to the `kafka_user` and creates sample tables.
-
-```sql
--- Grant CDC permissions to kafka_user (used by Debezium)
-GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'kafka_user'@'%';
-FLUSH PRIVILEGES;
-
--- Sample source tables
-CREATE TABLE IF NOT EXISTS orders (
-    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
-    customer_id BIGINT NOT NULL,
-    product_id  BIGINT NOT NULL,
-    quantity    INT NOT NULL,
-    amount      DECIMAL(10,2) NOT NULL,
-    status      VARCHAR(50) DEFAULT 'PENDING',
-    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS customers (
-    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-    name       VARCHAR(255) NOT NULL,
-    email      VARCHAR(255) UNIQUE NOT NULL,
-    phone      VARCHAR(50),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Insert sample data
-INSERT INTO customers (name, email, phone) VALUES
-  ('Alice Johnson', 'alice@example.com', '+1-555-0101'),
-  ('Bob Smith', 'bob@example.com', '+1-555-0102');
-
-INSERT INTO orders (customer_id, product_id, quantity, amount, status) VALUES
-  (1, 101, 2, 49.99, 'COMPLETED'),
-  (2, 102, 1, 99.00, 'PENDING');
-```
-
-- [ ] `scripts/mysql-init.sql` created
-
----
-
-## Step 2.3 — Create `scripts/postgres-init.sql`
-
-This runs automatically when the PostgreSQL container first starts. It creates the target schema and tables.
-
-```sql
--- Grant permissions
-GRANT ALL PRIVILEGES ON DATABASE targetdb TO kafka_user;
-
--- Create target schema
-CREATE SCHEMA IF NOT EXISTS pipeline;
-
--- Target tables (mirror source structure + CDC metadata columns)
-CREATE TABLE IF NOT EXISTS pipeline.orders (
-    id           BIGINT PRIMARY KEY,
-    customer_id  BIGINT,
-    product_id   BIGINT,
-    quantity     INT,
-    amount       NUMERIC(10,2),
-    status       VARCHAR(50),
-    created_at   TIMESTAMP,
-    updated_at   TIMESTAMP,
-    _cdc_op      VARCHAR(10),
-    _ingested_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS pipeline.customers (
-    id           BIGINT PRIMARY KEY,
-    name         VARCHAR(255),
-    email        VARCHAR(255),
-    phone        VARCHAR(50),
-    created_at   TIMESTAMP,
-    _cdc_op      VARCHAR(10),
-    _ingested_at TIMESTAMP DEFAULT NOW()
-);
-```
-
-- [ ] `scripts/postgres-init.sql` created
-
----
-
-## Step 2.4 — Create `monitoring/prometheus.yml`
-
-```yaml
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
-
-scrape_configs:
-  - job_name: "kafka"
-    static_configs:
-      - targets: ["kafka:7071"]
-    metrics_path: /metrics
-
-  - job_name: "kafka-exporter"
-    static_configs:
-      - targets: ["kafka-exporter:9308"]
-
-  - job_name: "kafka-connect"
-    static_configs:
-      - targets: ["kafka-connect:7072"]
-    metrics_path: /metrics
-```
-
-- [ ] `monitoring/prometheus.yml` created
-
----
-
-## Step 2.5 — Start all services
-
-Run from inside the `kafka-pipeline/` directory:
-
-- **Pull images one by one (more stable on slow connections)**
-
-```
+```bash
 docker pull confluentinc/cp-kafka:7.6.1
 docker pull confluentinc/cp-schema-registry:7.6.1
 docker pull debezium/connect:2.6
 docker pull provectuslabs/kafka-ui:latest
-docker pull mysql:8.0
-docker pull postgres:16
 docker pull danielqsj/kafka-exporter:latest
 docker pull prom/prometheus:latest
 docker pull grafana/grafana:latest
 ```
 
-- **Then run docker compose up -d after all pulls complete.**
+Option A only (Docker databases):
+
+```bash
+docker pull mysql:8.0
+docker pull postgres:16
+```
+
+---
+
+## Step 4.6 — Start all containers
+
+**Why:** `docker compose up -d` starts all services defined in `docker-compose.yml` in detached mode (background). On first run it downloads images and creates volumes (~15 min). Subsequent starts take ~60 seconds.
+
+Run from your project root directory (where `docker-compose.yml` is):
+
+**Windows PowerShell:**
 
 ```powershell
 docker compose up -d
 ```
 
-This pulls all images on first run (~15 minutes depending on internet speed). Subsequent starts take ~60 seconds.
-
-Watch the startup progress:
-
-```powershell
-# Watch service health status (refresh every 5 seconds)
-docker compose ps
-```
-
-Wait until all services show `healthy` or `running`. The `kafka-connect` container takes the longest (~2–3 minutes) because it waits for `kafka` and `schema-registry` to pass their healthchecks.
-
-- [ ] `docker compose up -d` ran without errors
-
----
-
-## Step 2.6 — Verify all services are healthy
-
-```powershell
-docker compose ps
-```
-
-Expected output (all services `running` or `healthy`):
-
-```
-NAME               IMAGE                                    STATUS
-kafka              confluentinc/cp-kafka:7.6.1              Up (healthy)
-schema-registry    confluentinc/cp-schema-registry:7.6.1   Up (healthy)
-kafka-connect      debezium/connect:2.6                     Up (healthy)
-kafka-ui           provectuslabs/kafka-ui:latest            Up
-mysql-source       mysql:8.0                                Up
-postgres-target    postgres:16                              Up
-kafka-exporter     danielqsj/kafka-exporter:latest          Up
-prometheus         prom/prometheus:latest                   Up
-grafana            grafana/grafana:latest                   Up
-```
-
-Verify key endpoints respond:
-
-```powershell
-# Schema Registry
-curl http://localhost:8081/subjects
-
-# Kafka Connect (returns JSON with version info)
-curl http://localhost:8083/
-
-# Kafka UI
-# Open http://localhost:8090 in your browser
-```
-
-- [ ] All containers are running
-- [ ] `curl http://localhost:8081/subjects` returns `[]`
-- [ ] `curl http://localhost:8083/` returns a JSON response
-- [ ] http://localhost:8090 loads the Kafka UI
-
----
-
-## Common Errors — Phase 2
-
-**Error: `kafka-connect` keeps restarting**
-- Cause: Kafka or Schema Registry not healthy yet.
-- Fix: Wait 2–3 minutes and run `docker compose ps` again. Kafka Connect retries automatically.
-
-**Error: `bind: address already in use` on port 3306, 5432, etc.**
-- Cause: You have a local MySQL or PostgreSQL running on the same port.
-- Fix: Stop the local service, or change the host port in `docker-compose.yml` (e.g., `"3307:3306"`).
-
-**Error: Docker ran out of memory**
-- Cause: Default Docker Desktop memory limit (often 2 GB) is too low.
-- Fix: Docker Desktop → Settings → Resources → Memory → set to **8 GB**.
-
-**Error: `CLUSTER_ID` mismatch on restart**
-- Cause: The Kafka data volume has a different cluster ID from the one in `docker-compose.yml`.
-- Fix: `docker compose down -v` (removes volumes, clean slate), then `docker compose up -d`.
-
----
-
----
-
-# Phase 3: Kafka Topics (Day 1)
-
-**Time estimate:** 10 minutes
-
----
-
-## Step 3.1 — Create `scripts/create-topics.sh`
+**Linux / macOS:**
 
 ```bash
-#!/bin/bash
-
-KAFKA_CONTAINER="kafka"
-BOOTSTRAP="localhost:9092"
-
-create_topic() {
-  local topic=$1
-  local partitions=${2:-3}
-  local replication=${3:-1}
-  local retention_ms=${4:-604800000}  # 7 days default
-
-  docker exec $KAFKA_CONTAINER kafka-topics \
-    --create \
-    --bootstrap-server $BOOTSTRAP \
-    --topic "$topic" \
-    --partitions $partitions \
-    --replication-factor $replication \
-    --config retention.ms=$retention_ms \
-    --if-not-exists
-
-  echo "Created topic: $topic"
-}
-
-# CDC source topics — one per table
-create_topic "prod.mysql.sourcedb.orders"     3 1
-create_topic "prod.mysql.sourcedb.customers"  3 1
-create_topic "prod.mysql.sourcedb.products"   3 1
-
-# Dead Letter Queue — retain forever (-1)
-create_topic "prod.dlq.errors" 1 1 -1
-
-# Kafka Connect internal topics (required before connectors can start)
-create_topic "_connect-configs"  1 1
-create_topic "_connect-offsets" 25 1
-create_topic "_connect-status"   5 1
-
-echo ""
-echo "All topics created. Current topic list:"
-docker exec $KAFKA_CONTAINER kafka-topics \
-  --list \
-  --bootstrap-server $BOOTSTRAP
+docker compose up -d
 ```
 
-- [ ] `scripts/create-topics.sh` created
+Watch startup progress:
+
+```bash
+docker compose ps
+```
+
+Wait until all services show `healthy` or `running`. `kafka-connect` takes the longest (~2–3 minutes).
 
 ---
 
-## Step 3.2 — Run the topic creation script
+## Step 4.7 — Verify all services are healthy
+
+```bash
+docker compose ps
+```
+
+Expected output (Option A — 9 containers):
+
+```
+NAME              IMAGE                                    STATUS
+kafka             confluentinc/cp-kafka:7.6.1              Up (healthy)
+schema-registry   confluentinc/cp-schema-registry:7.6.1   Up (healthy)
+kafka-connect     debezium/connect:2.6                     Up (healthy)
+kafka-ui          provectuslabs/kafka-ui:latest            Up
+mysql-source      mysql:8.0                                Up
+postgres-target   postgres:16                              Up
+kafka-exporter    danielqsj/kafka-exporter:latest          Up
+prometheus        prom/prometheus:latest                   Up
+grafana           grafana/grafana:latest                   Up
+```
+
+Verify key endpoints:
+
+**Windows PowerShell:**
 
 ```powershell
-# Git Bash or WSL
-bash scripts/create-topics.sh
+# Schema Registry — should return []
+curl.exe http://localhost:8081/subjects
 
-# PowerShell alternative — run each command individually via docker exec
+# Kafka Connect — should return JSON with version info
+curl.exe http://localhost:8083/
+
+# Kafka UI — open in browser
+Start-Process "http://localhost:8090"
+```
+
+**Linux / macOS:**
+
+```bash
+curl http://localhost:8081/subjects    # returns []
+curl http://localhost:8083/            # returns {"version":"3.7.0",...}
+```
+
+> **Important — curl vs curl.exe on Windows PowerShell:**
+> In PowerShell, `curl` is an alias for `Invoke-WebRequest` which shows verbose HTML output and security warnings. Always use `curl.exe` (the real curl binary) for API calls. `curl` works as-is on Linux and macOS.
+
+---
+
+## Phase 4 — Common Errors
+
+**Error: `port 3306 already in use`**
+- Your local MySQL is running on port 3306.
+- Fix: Change the MySQL container mapping to `"3307:3306"` in `docker-compose.yml` (already done in the config above).
+
+**Error: `port 8080 already in use`**
+- Another service (Spring Boot, Tomcat) is using port 8080.
+- Fix: Use `"8090:8080"` for Kafka UI (already done in the config above).
+
+**Error: `monitoring/prometheus.yml: no such file`**
+- The prometheus volume mount fails if the file doesn't exist on the host.
+- Fix: Create `monitoring/prometheus.yml` first (Step 4.3), then run `docker compose up -d`.
+
+**Error: `TLS handshake timeout` during image pull**
+- Network issue. Fix: Retry `docker compose up -d` — Docker resumes from cached layers.
+- Or pull images one at a time (Step 4.5).
+
+**Error: `CLUSTER_ID mismatch` on restart**
+- Kafka's data volume has a different cluster ID from `docker-compose.yml`.
+- Fix: `docker compose down -v` (removes volumes), then `docker compose up -d`.
+
+**kafka-exporter keeps restarting**
+- It started before Kafka was fully ready.
+- Fix: `docker compose restart kafka-exporter` after Kafka shows `healthy`.
+
+---
+
+---
+
+# Phase 5: Kafka Topics
+
+**Why create topics manually?**
+Kafka is configured with `KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"`. This prevents connectors from accidentally creating topics with wrong partition counts or retention settings. We create them explicitly with the correct configuration before registering connectors.
+
+---
+
+## Step 5.1 — Create all required topics
+
+**Windows PowerShell:**
+
+```powershell
+# CDC source topics — one per MySQL table being captured
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.mysql.sourcedb.orders --partitions 3 --replication-factor 1 --config retention.ms=604800000 --if-not-exists
 
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.mysql.sourcedb.customers --partitions 3 --replication-factor 1 --config retention.ms=604800000 --if-not-exists
 
+# Dead Letter Queue — retains failed messages forever (-1) for investigation
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.dlq.errors --partitions 1 --replication-factor 1 --config retention.ms=-1 --if-not-exists
 
+# Kafka Connect internal topics — required for connector config/offset/status storage
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic _connect-configs --partitions 1 --replication-factor 1 --if-not-exists
 
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic _connect-offsets --partitions 25 --replication-factor 1 --if-not-exists
 
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic _connect-status --partitions 5 --replication-factor 1 --if-not-exists
 
-# Required by Debezium heartbeat (prevents UNKNOWN_TOPIC_OR_PARTITION warnings)
+# Required by Debezium heartbeat — without this you get UNKNOWN_TOPIC_OR_PARTITION errors
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic __debezium-heartbeat.prod.mysql --partitions 1 --replication-factor 1 --if-not-exists
 
 # Required by Debezium schema changes (include.schema.changes: true)
 docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic prod.mysql --partitions 1 --replication-factor 1 --if-not-exists
 ```
 
-> **Note:** These 2 topics are required by Debezium. Without them you will see UNKNOWN_TOPIC_OR_PARTITION warnings in kafka-connect logs and the heartbeat will fail.
+**Linux / macOS (Git Bash on Windows also works):**
 
-- [ ] Topics created without errors
+```bash
+# Run all at once with a loop
+for TOPIC in \
+  "prod.mysql.sourcedb.orders:3" \
+  "prod.mysql.sourcedb.customers:3" \
+  "prod.mysql.sourcedb.products:3" \
+  "prod.dlq.errors:1" \
+  "_connect-configs:1" \
+  "_connect-offsets:25" \
+  "_connect-status:5" \
+  "__debezium-heartbeat.prod.mysql:1" \
+  "prod.mysql:1"; do
+  NAME=$(echo $TOPIC | cut -d: -f1)
+  PARTS=$(echo $TOPIC | cut -d: -f2)
+  docker exec kafka kafka-topics --create \
+    --bootstrap-server localhost:9092 \
+    --topic "$NAME" \
+    --partitions $PARTS \
+    --replication-factor 1 \
+    --if-not-exists
+  echo "Created: $NAME"
+done
+```
 
 ---
 
-## Step 3.3 — Verify topics in Kafka UI
+## Step 5.2 — Verify topics exist
 
-1. Open http://localhost:8090
-2. Click **Topics** in the left sidebar
-3. You should see these topics listed:
-   - `prod.mysql.sourcedb.orders` (3 partitions)
-   - `prod.mysql.sourcedb.customers` (3 partitions)
-   - `prod.mysql.sourcedb.products` (3 partitions)
-   - `prod.dlq.errors` (1 partition)
-   - `_connect-configs`, `_connect-offsets`, `_connect-status`
-   - `__debezium-heartbeat.prod.mysql` (1 partition)
-   - `prod.mysql` (1 partition)
-
-Alternatively, verify via CLI:
-
-```powershell
+```bash
 docker exec kafka kafka-topics --list --bootstrap-server localhost:9092
 ```
 
-- [ ] All required topics appear in Kafka UI or CLI output
+Or open Kafka UI: http://localhost:8090 → **Topics**
 
 ---
 
-## Common Errors — Phase 3
+## Phase 5 — Common Errors
 
-**Error: `Error while executing topic command : Topic 'X' already exists`**
-- This is safe to ignore. The `--if-not-exists` flag prevents it from being fatal.
+**Error: `UNKNOWN_TOPIC_OR_PARTITION: __debezium-heartbeat.prod.mysql`**
+- This error appears in `docker logs kafka-connect` when the heartbeat topic is missing.
+- Fix: Create the `__debezium-heartbeat.prod.mysql` topic (included in Step 5.1 above).
 
-**Error: `Connection to node -1 could not be established`**
-- Kafka is not ready yet. Wait 30 seconds and retry.
-
-**Error: Script not found or permission denied (Windows)**
-- Use Git Bash or WSL to run `.sh` scripts, or use the PowerShell `docker exec` commands shown above.
-
----
+**Error: `UNKNOWN_TOPIC_OR_PARTITION: prod.mysql`**
+- Missing topic for schema change events (`include.schema.changes: true`).
+- Fix: Create the `prod.mysql` topic (included in Step 5.1 above).
 
 ---
 
-# Phase 4: Source Connector — MySQL CDC (Day 2)
+---
 
-**Time estimate:** 15–20 minutes
+# Phase 6: Source Connector — MySQL CDC
 
 ---
 
-## Step 4.1 — Create `connectors/source/mysql-cdc-source.json`
+## Step 6.1 — Understanding the source connector config
 
-This configures the Debezium MySQL connector to read the MySQL binlog and publish change events to Kafka topics.
+Before creating the file, understand the key settings:
 
-Key decisions in this config:
-- `snapshot.mode: initial` — takes a full snapshot of existing data on first start, then streams changes
-- `ExtractNewRecordState` transform — unwraps the Debezium envelope so the Kafka message contains the flat row
-- DLQ configured so bad records don't block the connector
+| Setting | Value | Why |
+|---------|-------|-----|
+| `connector.class` | `io.debezium.connector.mysql.MySqlConnector` | The MySQL CDC connector class bundled in `debezium/connect:2.6` |
+| `key.converter.schemas.enable` | `true` | **CRITICAL** — The Debezium JDBC Sink connector needs schema info embedded in messages. Setting this to `false` causes `valueSchema() is null` errors and the sink writes 0 rows silently. |
+| `value.converter.schemas.enable` | `true` | Same as above — both key and value schemas must be included. |
+| `transforms.unwrap.drop.tombstones` | `true` | **CRITICAL** — When MySQL deletes a row, Debezium sends 2 messages: a rewrite record (`__deleted: true`) and a tombstone (null value). The Debezium JDBC Sink crashes on tombstone messages with `primary key mode 'record_value' cannot have null schema`. Setting this to `true` drops tombstones before they reach the sink. |
+| `transforms.unwrap.delete.handling.mode` | `rewrite` | Converts DELETE events to UPDATE events with `__deleted: true`. The row stays in PostgreSQL but is marked as deleted (soft delete / audit trail). |
+| `snapshot.mode` | `initial` | Takes a full snapshot of existing data on first start, then streams new changes. If connector offsets already exist (from a previous run), the snapshot is SKIPPED. Only run on first registration. |
+| `database.server.id` | `184054` | The server ID Debezium uses to register as a MySQL replica. Must be unique across all MySQL replicas. Any number not used by other replicas. |
 
-> **CRITICAL — schemas.enable must be true:** The Debezium JDBC Sink Connector requires embedded schema information in messages. Setting `schemas.enable: false` causes `valueSchema() is null` errors and the sink will FAIL silently.
+---
 
-> **CRITICAL — drop.tombstones must be true:** When MySQL DELETEs a row, Debezium sends both a rewrite record (`__deleted: true`) AND a tombstone (null value). The Debezium JDBC Sink crashes on tombstone messages with `primary key mode 'record_value' cannot have null schema`. Setting `drop.tombstones: true` prevents tombstones from reaching the sink.
+## Step 6.2 — Create `connectors/source/mysql-cdc-source.json`
 
-**Option A (Docker MySQL):** Use `"database.hostname": "mysql"` — the Docker service name.
-
-**Option B (VPS MySQL):** Replace `"database.hostname"` and credentials with your VPS values. See the substitution table below the JSON.
+### Option A — Docker MySQL
 
 ```json
 {
@@ -1105,32 +1163,85 @@ Key decisions in this config:
 }
 ```
 
-### Option B — VPS MySQL substitutions
+### Option B — VPS MySQL
 
-If using a VPS MySQL, change these fields in the JSON:
+Change only these fields:
+
+```json
+{
+  "name": "mysql-cdc-source",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "YOUR_VPS_IP",
+    "database.port": "3306",
+    "database.user": "kafka_user",
+    "database.password": "YOUR_PASSWORD",
+    "database.server.id": "184054",
+    "database.server.name": "prod.mysql",
+
+    "topic.prefix": "prod.mysql",
+    "database.include.list": "sourcedb",
+    "table.include.list": "sourcedb.orders,sourcedb.customers",
+
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "_schema-changes.mysql",
+
+    "include.schema.changes": "true",
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "minimal",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true",
+
+    "transforms": "unwrap,addMetadata",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.add.fields": "op,ts_ms,source.db,source.table",
+    "transforms.unwrap.delete.handling.mode": "rewrite",
+    "transforms.unwrap.drop.tombstones": "true",
+
+    "transforms.addMetadata.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.addMetadata.static.field": "_pipeline_version",
+    "transforms.addMetadata.static.value": "1.0",
+
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true",
+    "errors.deadletterqueue.topic.name": "prod.dlq.errors",
+    "errors.deadletterqueue.topic.replication.factor": "1",
+
+    "heartbeat.interval.ms": "10000",
+    "max.batch.size": "2048",
+    "max.queue.size": "8192"
+  }
+}
+```
 
 | Field | Option A (Docker) | Option B (VPS) |
 |-------|------------------|----------------|
-| `database.hostname` | `"mysql"` | `"62.171.177.208"` e.g. `"31.220.75.206"` |
-| `database.port` | `"3306"` | `"3306"` (or your custom port) |
-| `database.user` | `"kafka_user"` | your MySQL user |
-| `database.password` | `"kafka_password"` | `"ImR$$L007"` |
-| `database.include.list` | `"sourcedb"` | your database name |
-| `table.include.list` | `"sourcedb.orders,sourcedb.customers"` | `"yourdb.yourtable"` |
-
-- [ ] `connectors/source/mysql-cdc-source.json` created
+| `database.hostname` | `"mysql"` | `"YOUR_VPS_IP"` e.g. `"62.171.177.208"` |
+| `database.password` | `"kafka_password"` | `"YOUR_PASSWORD"` |
 
 ---
 
-## Step 4.2 — Register the source connector
+## Step 6.3 — Register the source connector
+
+**Why:** The connector config is registered via the Kafka Connect REST API. Kafka Connect stores it in the `_connect-configs` Kafka topic, so it survives restarts automatically. You only need to register once — after that it auto-starts on `docker compose up`.
+
+**Windows PowerShell:**
 
 ```powershell
-# Option 1: curl.exe (recommended in PowerShell — @ reads directly from file)
 curl.exe -X POST http://localhost:8083/connectors `
   -H "Content-Type: application/json" `
   -d "@connectors/source/mysql-cdc-source.json"
+```
 
-# Option 2: Invoke-RestMethod (native PowerShell)
+Alternative (native PowerShell, no curl.exe needed):
+
+```powershell
 $body = Get-Content connectors/source/mysql-cdc-source.json -Raw
 Invoke-RestMethod -Method Post `
   -Uri "http://localhost:8083/connectors" `
@@ -1138,7 +1249,7 @@ Invoke-RestMethod -Method Post `
   -Body $body
 ```
 
-Git Bash version:
+**Linux / macOS / Git Bash:**
 
 ```bash
 curl -X POST http://localhost:8083/connectors \
@@ -1146,132 +1257,137 @@ curl -X POST http://localhost:8083/connectors \
   -d @connectors/source/mysql-cdc-source.json
 ```
 
-Expected response — the connector config echoed back as JSON with no error field.
-
-- [ ] Connector registered without error
+Expected response: the connector config echoed back as JSON with no `error_code` field.
 
 ---
 
-## Step 4.3 — Verify connector status
+## Step 6.4 — Verify source connector is running
 
-Wait 10–15 seconds for the connector to start, then:
-
-```powershell
+```bash
+# Windows PowerShell
 curl.exe http://localhost:8083/connectors/mysql-cdc-source/status
+
+# Linux / macOS
+curl http://localhost:8083/connectors/mysql-cdc-source/status
 ```
 
-Expected output:
+Expected:
 
 ```json
 {
   "name": "mysql-cdc-source",
-  "connector": {
-    "state": "RUNNING",
-    "worker_id": "kafka-connect:8083"
-  },
-  "tasks": [
-    {
-      "id": 0,
-      "state": "RUNNING",
-      "worker_id": "kafka-connect:8083"
-    }
-  ],
+  "connector": { "state": "RUNNING" },
+  "tasks": [{ "id": 0, "state": "RUNNING" }],
   "type": "source"
 }
 ```
 
 Both `connector.state` and `tasks[0].state` must be `RUNNING`.
 
-- [ ] Connector state is `RUNNING`
-- [ ] Task state is `RUNNING`
-
 ---
 
-## Step 4.4 — Verify snapshot data appeared in Kafka
+## Step 6.5 — Verify snapshot data is in Kafka
 
-After the connector starts, Debezium immediately takes a snapshot of all existing rows and publishes them to Kafka.
+After the connector starts, Debezium takes a snapshot of all existing rows in MySQL and publishes them to Kafka. This happens automatically within ~30 seconds.
 
-```powershell
-# Check message count in the orders topic
-docker exec kafka kafka-run-class kafka.tools.GetOffsetShell `
-  --broker-list localhost:9092 `
+```bash
+# Check message count in orders topic
+docker exec kafka kafka-run-class kafka.tools.GetOffsetShell \
+  --broker-list localhost:9092 \
   --topic prod.mysql.sourcedb.orders
 ```
 
-You should see non-zero offsets. The initial snapshot should have published the 2 sample orders.
+You should see non-zero offsets (one offset per partition).
 
-In Kafka UI (http://localhost:8090):
-1. Click **Topics** → `prod.mysql.sourcedb.orders`
-2. Click **Messages** tab
-3. You should see 2 messages from the initial snapshot
+Check actual message content:
 
-- [ ] Messages appear in `prod.mysql.sourcedb.orders` topic
+```bash
+# Windows PowerShell
+docker exec kafka kafka-console-consumer `
+  --bootstrap-server localhost:9092 `
+  --topic prod.mysql.sourcedb.orders `
+  --from-beginning `
+  --max-messages 3 `
+  --timeout-ms 10000
 
----
+# Linux / macOS
+docker exec kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic prod.mysql.sourcedb.orders \
+  --from-beginning \
+  --max-messages 3 \
+  --timeout-ms 10000
+```
 
-## Step 4.5 — Important: snapshot.mode and existing data
-
-> **Why existing MySQL rows may not appear in Kafka:**
->
-> `snapshot.mode: initial` takes a snapshot ONLY if no connector offsets exist. If you delete and re-register the connector with the same name, it finds existing offsets in `_connect-offsets` and SKIPS the snapshot. Only new changes (INSERT/UPDATE/DELETE) will be captured.
->
-> **To force existing rows into Kafka**, trigger a real UPDATE on them:
-> ```sql
-> -- Changes something real so MySQL generates a binlog event
-> UPDATE orders SET updated_at = NOW() WHERE id IN (1, 2, 3);
-> -- For tables without updated_at, change any column value:
-> UPDATE customers SET phone = '+1-555-0101' WHERE id = 1;
-> ```
->
-> **IMPORTANT — MySQL no-op UPDATE rule:**
-> MySQL will NOT generate a binlog event if the UPDATE doesn't actually change any value. Always update to a different value, otherwise no CDC event is produced.
+Each message should be a large JSON object with both `"schema"` and `"payload"` fields. If you see raw binary data, the converter is wrong (check `schemas.enable` settings).
 
 ---
 
-## Common Errors — Phase 4
+## Phase 6 — Common Errors
 
-**Error: `connector.state` is `FAILED`**
-- Run: `curl http://localhost:8083/connectors/mysql-cdc-source/status` and look at the `trace` field.
-- Common sub-causes:
-  - MySQL not ready: wait 30s and try again
-  - Wrong credentials: verify `kafka_user`/`kafka_password` in the JSON
-  - Binlog not enabled: check MySQL with `docker exec mysql-source mysql -u root -prootpassword -e "SHOW VARIABLES LIKE 'log_bin';"` — should show `ON`
+**Error: connector state is FAILED**
 
-**Error: `Access denied` for user `kafka_user`**
-- The `mysql-init.sql` may not have run yet (MySQL takes ~30s to initialize on first start).
-- Check: `docker logs mysql-source | tail -20`
-- Fix: `docker compose restart mysql` and wait for it to be healthy again.
+Check the trace:
 
-**Error: `_schema-changes.mysql` topic does not exist**
-- Debezium creates this topic automatically. If it fails, manually create it:
-  ```powershell
-  docker exec kafka kafka-topics --create --bootstrap-server localhost:9092 --topic _schema-changes.mysql --partitions 1 --replication-factor 1
-  ```
+```bash
+curl.exe http://localhost:8083/connectors/mysql-cdc-source/status
+```
 
-**Connector keeps restarting but never reaches RUNNING**
-- Check the Kafka Connect logs: `docker logs kafka-connect --tail 50`
-- The most common cause is a Schema Registry connection issue. Verify: `curl http://localhost:8081/subjects`
+Look at the `trace` field in the response. Common causes:
+- MySQL not reachable — check hostname and port
+- Wrong credentials — check `database.user` and `database.password`
+- Binlog not enabled — check with `SHOW VARIABLES LIKE 'log_bin';`
+
+**Error: `Connector mysql-cdc-source already exists` (error_code: 409)**
+
+- Connector is already registered and running. This is fine.
+- Kafka Connect stores connector configs in the `_connect-configs` Kafka topic, so they survive `docker compose down/up`. You only need to register once.
+- If you want to update the config: delete and re-register.
+
+**Error: Messages in Kafka have no schema (just raw values)**
+
+- Cause: `schemas.enable: false` somewhere in the config.
+- Fix: Ensure both `key.converter.schemas.enable: true` AND `value.converter.schemas.enable: true` are set in the connector JSON.
+- After fixing, delete the connector + topics + recreate (old schemaless messages must be cleared).
+
+**Snapshot.mode skips existing data on re-registration**
+
+- `snapshot.mode: initial` only snapshots if NO stored offsets exist for this connector name.
+- If you delete and re-register with the SAME connector name, Debezium finds the existing offsets in `_connect-offsets` and skips the snapshot — only new changes (INSERT/UPDATE/DELETE after registration) will be captured.
+- Fix option 1: Trigger real MySQL UPDATEs to force CDC events for existing rows.
+- Fix option 2: Use a new connector name to force a fresh snapshot (see Troubleshooting section).
 
 ---
 
 ---
 
-# Phase 5: Sink Connector — PostgreSQL (Day 2)
-
-**Time estimate:** 15–20 minutes
+# Phase 7: Sink Connector — PostgreSQL
 
 ---
 
-## Step 5.1 — Create `connectors/sink/postgres-sink.json`
+## Step 7.1 — Understanding the sink connector config
 
-This configures the **Debezium JDBC Sink Connector** to read from the Kafka CDC topics and upsert records into PostgreSQL.
+**Why Debezium JDBC Sink, not Confluent JDBC Sink?**
 
-> **Important:** The `debezium/connect:2.6` image includes `io.debezium.connector.jdbc.JdbcSinkConnector` — NOT the Confluent `io.confluent.connect.jdbc.JdbcSinkConnector`. Property names differ between the two.
+The `debezium/connect:2.6` image bundles `io.debezium.connector.jdbc.JdbcSinkConnector`. The Confluent `io.confluent.connect.jdbc.JdbcSinkConnector` is NOT included. Attempting to use the Confluent class name causes `connector.class not found` errors.
 
-Key decisions:
-- `insert.mode: upsert` with `primary.key.fields: id` — safe to replay; duplicate messages produce the same result
-- `schema.evolution: basic` — auto-creates/evolves the table if it doesn't exist
-- `RegexRouter` transform — maps topic `prod.mysql.sourcedb.orders` → table `pipeline.orders`
+| Property | Confluent JDBC (WRONG for this image) | Debezium JDBC (CORRECT) |
+|----------|--------------------------------------|------------------------|
+| connector class | `io.confluent.connect.jdbc.JdbcSinkConnector` | `io.debezium.connector.jdbc.JdbcSinkConnector` |
+| username | `connection.user` | `connection.username` |
+| primary key | `pk.mode` | `primary.key.mode` |
+| pk fields | `pk.fields` | `primary.key.fields` |
+| auto create | `auto.create: true` | `schema.evolution: basic` |
+
+**What the RegexRouter transform does:**
+
+The Kafka topic name is `prod.mysql.sourcedb.orders`. Without transformation, the sink would try to create a table named `prod.mysql.sourcedb.orders` (which is invalid in PostgreSQL). The RegexRouter maps `prod.mysql.sourcedb.orders` → `orders`, and then `table.name.format: pipeline.${topic}` makes the full table name `pipeline.orders`.
+
+---
+
+## Step 7.2 — Create `connectors/sink/postgres-sink.json`
+
+### Option A — Docker PostgreSQL
 
 ```json
 {
@@ -1314,59 +1430,43 @@ Key decisions:
 }
 ```
 
-| Confluent JDBC (old) | Debezium JDBC (correct) |
-|----------------------|------------------------|
-| `io.confluent.connect.jdbc.JdbcSinkConnector` | `io.debezium.connector.jdbc.JdbcSinkConnector` |
-| `connection.user` | `connection.username` |
-| `pk.mode` | `primary.key.mode` |
-| `pk.fields` | `primary.key.fields` |
-| `auto.create: true` | `schema.evolution: basic` |
+### Option B — VPS PostgreSQL
 
-### Option B — VPS PostgreSQL substitutions
-
-If using a VPS PostgreSQL, change these fields in the JSON:
+Change only these fields:
 
 | Field | Option A (Docker) | Option B (VPS) |
 |-------|------------------|----------------|
-| `connection.url` | `"jdbc:postgresql://postgres:5432/targetdb"` | `"jdbc:postgresql://62.171.177.208:5432/targetdb"` |
-| `connection.username` | `"kafka_user"` | your PostgreSQL user |
-| `connection.password` | `"kafka_password"` | `"ImR$$L007"` |
+| `connection.url` | `"jdbc:postgresql://postgres:5432/targetdb"` | `"jdbc:postgresql://YOUR_VPS_IP:5432/targetdb"` |
+| `connection.password` | `"kafka_password"` | `"YOUR_PASSWORD"` |
 
-Example for VPS:
+Example VPS values:
+
 ```json
 "connection.url": "jdbc:postgresql://62.171.177.208:5432/targetdb",
 "connection.username": "kafka_user",
-"connection.password": "ImR$$L007",
+"connection.password": "YOUR_PASSWORD",
 ```
 
-> **Test connectivity before registering the connector:**
+> **Test connectivity before registering:**
 > ```powershell
-> # From PowerShell — test if PostgreSQL port is reachable
-> Test-NetConnection -ComputerName 62.171.177.208 -Port 5432
+> # Windows
+> Test-NetConnection -ComputerName YOUR_VPS_IP -Port 5432
 > # TcpTestSucceeded: True = reachable
 > ```
 
-- [ ] `connectors/sink/postgres-sink.json` created
-
 ---
 
-## Step 5.2 — Register the sink connector
+## Step 7.3 — Register the sink connector
+
+**Windows PowerShell:**
 
 ```powershell
-# Option 1: curl.exe (recommended in PowerShell)
 curl.exe -X POST http://localhost:8083/connectors `
   -H "Content-Type: application/json" `
   -d "@connectors/sink/postgres-sink.json"
-
-# Option 2: Invoke-RestMethod (native PowerShell)
-$body = Get-Content connectors/sink/postgres-sink.json -Raw
-Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8083/connectors" `
-  -ContentType "application/json" `
-  -Body $body
 ```
 
-Git Bash:
+**Linux / macOS / Git Bash:**
 
 ```bash
 curl -X POST http://localhost:8083/connectors \
@@ -1374,146 +1474,345 @@ curl -X POST http://localhost:8083/connectors \
   -d @connectors/sink/postgres-sink.json
 ```
 
-- [ ] Sink connector registered without error
-
 ---
 
-## Step 5.3 — Verify sink connector status
+## Step 7.4 — Verify sink connector is running
 
-```powershell
+```bash
+# Windows PowerShell
+curl.exe http://localhost:8083/connectors/postgres-sink/status
+
+# Linux / macOS
 curl http://localhost:8083/connectors/postgres-sink/status
 ```
 
-Expected: both `connector.state` and `tasks[*].state` are `RUNNING`.
-
-- [ ] Sink connector state is `RUNNING`
+Expected: both `connector.state` and all `tasks[*].state` are `RUNNING`.
 
 ---
 
-## Step 5.4 — Understanding DELETE behaviour
+## Step 7.5 — Verify data synced to PostgreSQL
 
-MySQL DELETEs are handled as **soft deletes** in PostgreSQL. The row is NOT removed — it is updated with `__deleted: true` and `__op: d`.
+**Option A (Docker PostgreSQL):**
 
-```powershell
-# Test: delete a row in MySQL
-docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "DELETE FROM orders WHERE id = 5;"
+```bash
+# Windows PowerShell
+docker exec postgres-target psql -U kafka_user -d targetdb -c "SELECT * FROM pipeline.orders ORDER BY id;"
 
-# Check PostgreSQL — row stays but __deleted = true
-docker exec postgres-target psql -U kafka_user -d targetdb -c "SELECT id, __op, __deleted FROM pipeline.orders WHERE id=5;"
+# Linux / macOS
+docker exec postgres-target psql -U kafka_user -d targetdb -c "SELECT * FROM pipeline.orders ORDER BY id;"
 ```
 
-Expected result:
-```
- id | __op | __deleted
-----+------+-----------
-  5 | d    | true
+**Option B (VPS PostgreSQL — run on VPS):**
+
+```bash
+psql -U kafka_user -d targetdb -c "SELECT * FROM pipeline.orders ORDER BY id;"
 ```
 
-This is intentional — you keep a full audit trail. If you want hard deletes (physical removal from PostgreSQL), contact the advanced configuration in `06-data-sink.md`.
+You should see all rows from MySQL mirrored in PostgreSQL with extra columns: `__deleted`, `__op`, `__ts_ms`, `__source_db`, `__source_table`, `_pipeline_version`.
 
 ---
 
-## Step 5.5 — Verify data flowed MySQL → Kafka → PostgreSQL
+## Step 7.6 — Understanding DELETE behaviour
 
-Wait 30 seconds for the sink to process the initial snapshot messages, then:
+**What happens:** MySQL DELETEs are captured as soft deletes in PostgreSQL. The row is NOT removed — instead it gets `__deleted = "true"` and `__op = "d"`.
 
-```powershell
-docker exec postgres-target psql -U kafka_user -d targetdb -c "SELECT COUNT(*) FROM pipeline.orders;"
+**Why:** This is a deliberate design choice for audit trails. You always know what data existed and when it was deleted. If you want hard deletes (physical row removal), you need a custom consumer (Phase 9) instead of the JDBC sink connector.
+
+Test it:
+
+```bash
+# Option A — Docker MySQL
+docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "DELETE FROM orders WHERE id = 1;"
+
+# Option B — VPS MySQL (run on VPS)
+mysql -u kafka_user -p'YOUR_PASSWORD' sourcedb -e "DELETE FROM orders WHERE id = 1;"
 ```
 
-Expected: `2` (the two seed rows from `mysql-init.sql`).
+After ~3 seconds, check PostgreSQL:
 
-```powershell
-docker exec postgres-target psql -U kafka_user -d targetdb -c "SELECT * FROM pipeline.customers;"
+```bash
+# Should show __deleted = true, __op = d for id=1
+docker exec postgres-target psql -U kafka_user -d targetdb \
+  -c "SELECT id, __op, __deleted FROM pipeline.orders WHERE id = 1;"
 ```
-
-Expected: Alice Johnson and Bob Smith rows.
-
-- [ ] Data from MySQL appears in PostgreSQL
 
 ---
 
-## Step 5.6 — List all running connectors
+## Phase 7 — Common Errors
+
+**Error: `io.confluent.connect.jdbc.JdbcSinkConnector not found`**
+- You used the Confluent connector class name.
+- Fix: Use `io.debezium.connector.jdbc.JdbcSinkConnector`.
+
+**Error: `valueSchema() is null` — sink writes 0 rows**
+- Cause: Messages in the Kafka topic were produced with `schemas.enable: false`.
+- Fix: Set `key.converter.schemas.enable: true` and `value.converter.schemas.enable: true` on BOTH the source and sink connectors. Then do a full clean reset (see Troubleshooting).
+
+**Error: `primary key mode 'record_value' cannot have null schema` — sink FAILED**
+- Cause: Tombstone messages (null-value records) from MySQL DELETEs are in the topic.
+- Fix: Ensure source connector has `"transforms.unwrap.drop.tombstones": "true"`. For recovery from existing tombstones, see the Troubleshooting section.
+
+**Error: `must be owner of table orders` (VPS PostgreSQL)**
+- Cause: The `pipeline.orders` table was created by the `postgres` superuser, not by `kafka_user`. The sink tries to `ALTER TABLE` to add CDC columns but `kafka_user` doesn't have permission.
+- Fix: Drop the tables and let the sink recreate them as `kafka_user`:
+  ```sql
+  -- Run on VPS PostgreSQL
+  DROP TABLE IF EXISTS pipeline.orders;
+  DROP TABLE IF EXISTS pipeline.customers;
+  ```
+  Then restart the sink connector.
+
+**Sink RUNNING but 0 rows in PostgreSQL after switching from Docker to VPS MySQL**
+- Cause: The source connector has stale binlog offsets from Docker MySQL stored in `_connect-offsets`. When it connects to VPS MySQL, it tries to resume from the wrong binlog position and misses all events.
+- Fix: Rename the connector to force a fresh snapshot (see Troubleshooting section).
+
+---
+
+---
+
+# Phase 8: Full Clean Reset (When Things Go Wrong)
+
+**Use this procedure when:**
+- The Kafka topic has mixed data (from multiple MySQL sources or corrupt messages)
+- The sink is processing wrong data or 0 rows despite connector RUNNING
+- You want to start completely fresh with a new MySQL source
+
+---
+
+## Full clean reset procedure
+
+**Windows PowerShell:**
 
 ```powershell
-curl http://localhost:8083/connectors
+# Step 1: Delete both connectors
+curl.exe -X DELETE http://localhost:8083/connectors/mysql-cdc-source
+curl.exe -X DELETE http://localhost:8083/connectors/postgres-sink
+
+# Step 2: Delete CDC topics (removes all messages including corrupt/mixed data)
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --delete --topic prod.mysql.sourcedb.orders
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --delete --topic prod.mysql.sourcedb.customers
+
+# Step 3: Recreate topics clean
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --create --topic prod.mysql.sourcedb.orders --partitions 3 --replication-factor 1
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --create --topic prod.mysql.sourcedb.customers --partitions 3 --replication-factor 1
+
+# Step 4: Re-register source (will do a fresh snapshot)
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/source/mysql-cdc-source.json"
+
+# Step 5: Wait 20 seconds for snapshot to complete, then register sink
+Start-Sleep -Seconds 20
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/sink/postgres-sink.json"
 ```
 
-Expected:
+**Linux / macOS:**
+
+```bash
+# Steps 1-5 equivalent
+curl -X DELETE http://localhost:8083/connectors/mysql-cdc-source
+curl -X DELETE http://localhost:8083/connectors/postgres-sink
+
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --delete --topic prod.mysql.sourcedb.orders
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --delete --topic prod.mysql.sourcedb.customers
+
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --create --topic prod.mysql.sourcedb.orders --partitions 3 --replication-factor 1
+docker exec kafka kafka-topics --bootstrap-server localhost:9092 --create --topic prod.mysql.sourcedb.customers --partitions 3 --replication-factor 1
+
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connectors/source/mysql-cdc-source.json
+
+sleep 20
+
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connectors/sink/postgres-sink.json
+```
+
+Also drop and recreate PostgreSQL target tables so the sink recreates them with proper ownership:
+
+```sql
+-- Run on PostgreSQL (Docker or VPS)
+DROP TABLE IF EXISTS pipeline.orders;
+DROP TABLE IF EXISTS pipeline.customers;
+```
+
+---
+
+## Forcing a fresh snapshot when switching MySQL sources
+
+**Problem:** If you change `database.hostname` in the source connector from Docker MySQL to VPS MySQL (or vice versa) and re-register with the same connector name, the old binlog offsets from the previous MySQL server are still stored in `_connect-offsets`. Debezium reads those offsets and tries to resume from a position that doesn't exist on the new MySQL server. It will appear to run without errors but new CDC events won't appear in Kafka.
+
+**Solution:** Use a new connector name to force Debezium to treat it as a brand new registration with no existing offsets:
+
+1. Edit `connectors/source/mysql-cdc-source.json` — change `"name"` to a new unique name, e.g. `"mysql-cdc-source-v2"`
+2. Delete the old connector: `curl.exe -X DELETE http://localhost:8083/connectors/mysql-cdc-source`
+3. Register the new connector: `curl.exe -X POST http://localhost:8083/connectors -H "Content-Type: application/json" -d "@connectors/source/mysql-cdc-source.json"`
+4. Debezium will do a fresh snapshot of the new MySQL server
+
+---
+
+---
+
+# Phase 9: Troubleshooting Reference
+
+---
+
+## Tombstone messages causing sink FAILED
+
+**What happened:** MySQL DELETE generates two Kafka messages:
+1. A rewrite record: `{ ..., "__deleted": "true", "__op": "d" }` — this is the row data with deleted flag
+2. A tombstone: `null` (completely null value) — used for Kafka log compaction
+
+The Debezium JDBC Sink crashes on the tombstone message with:
+```
+primary key mode 'record_value' cannot have null schema
+```
+
+**Prevention:** Set `"transforms.unwrap.drop.tombstones": "true"` in the source connector (already in the config above).
+
+**Recovery if tombstones are already in the topic:**
+
+```powershell
+# 1. Delete the sink connector
+curl.exe -X DELETE http://localhost:8083/connectors/postgres-sink
+
+# 2. Reset consumer group offsets to LATEST (skips all existing tombstone messages)
+docker exec kafka kafka-consumer-groups `
+  --bootstrap-server localhost:9092 `
+  --group connect-postgres-sink `
+  --reset-offsets --to-latest `
+  --topic prod.mysql.sourcedb.orders --execute
+
+docker exec kafka kafka-consumer-groups `
+  --bootstrap-server localhost:9092 `
+  --group connect-postgres-sink `
+  --reset-offsets --to-latest `
+  --topic prod.mysql.sourcedb.customers --execute
+
+# 3. Re-register the sink (will start from latest, processing only new messages)
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/sink/postgres-sink.json"
+```
+
+> **Note after tombstone recovery:** The sink now starts from the latest offset, so historical data already in the topic is skipped. Do a fresh INSERT or UPDATE in MySQL to verify the pipeline is working. If you need all historical data, do a full clean reset (Phase 8) instead.
+
+---
+
+## `schemas.enable: false` — sink writes 0 rows silently
+
+**What happened:** The Debezium JDBC Sink connector needs schema information embedded in each Kafka message to know column types and names. If messages were produced with `schemas.enable: false` (stripped schema), the sink receives messages with `valueSchema() = null` and silently processes 0 rows.
+
+**How to detect:**
+
+```bash
+# Check a raw message from the topic
+docker exec kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic prod.mysql.sourcedb.orders \
+  --from-beginning \
+  --max-messages 1 \
+  --timeout-ms 5000
+```
+
+If the message starts with `{"schema":{"type":"struct",...},"payload":{...}}` → schemas are embedded ✓
+
+If the message starts with `{"id":1,"customer_id":...}` (just payload, no schema wrapper) → schemas are missing ✗
+
+**Fix:** Set `key.converter.schemas.enable: true` AND `value.converter.schemas.enable: true` in both source and sink connector JSON. Then do a full clean reset (Phase 8) to clear the old schemaless messages from the topic.
+
+---
+
+## Bad message in Kafka topic causing deserialization errors
+
+**What happened:** A plain-text or non-JSON message (e.g., `hello`) was published to a CDC topic. The JsonConverter can't parse it and logs:
+```
+Unrecognized token 'hello': was expecting JSON String, Number, Array, Object...
+```
+
+**How to detect:**
+
+```bash
+docker logs kafka-connect --tail 50
+# Look for: JsonParseException or SerializationException
+```
+
+**Fix:**
+
+The sink connector's `errors.tolerance: all` should route bad messages to the DLQ (`prod.dlq.errors`). If the sink is stuck:
+
+```bash
+# Check DLQ for the bad messages
+docker exec kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic prod.dlq.errors \
+  --from-beginning \
+  --max-messages 10 \
+  --timeout-ms 5000
+```
+
+If the sink is FAILED, use the tombstone recovery procedure above to reset offsets to latest and skip the bad message.
+
+---
+
+## Connector already exists (409 error)
+
+**What happened:** You tried to register a connector that's already registered.
 
 ```json
-["mysql-cdc-source","postgres-sink"]
+{"error_code":409,"message":"Connector mysql-cdc-source already exists"}
 ```
 
-- [ ] Both connectors listed
+**What to do:** Nothing — this is expected. Connector configs are stored in Kafka's `_connect-configs` topic and survive `docker compose down/up`. The connector auto-restarts when Kafka Connect comes back up. Check status to confirm it's running:
+
+```bash
+curl.exe http://localhost:8083/connectors/mysql-cdc-source/status
+```
 
 ---
 
-## Common Errors — Phase 5
+## Checking connector logs for errors
 
-**Error: `JdbcSinkConnector not found` or `connector.class not found`**
-- Cause: Using `io.confluent.connect.jdbc.JdbcSinkConnector` — that class is not in the Debezium image.
-- Fix: Use `io.debezium.connector.jdbc.JdbcSinkConnector` (already corrected in the JSON above).
-  ```powershell
-  docker exec kafka-connect confluent-hub install confluentinc/kafka-connect-jdbc:10.7.4 --no-prompt
-  docker restart kafka-connect
-  ```
-  Wait for kafka-connect to become healthy again before re-registering the sink.
+```bash
+# Last 50 lines of Kafka Connect logs
+docker logs kafka-connect --tail 50
 
-**Error: `Table "pipeline.prod.mysql.sourcedb.orders" does not exist`**
-- This is fine. `auto.create: true` will create it. Check PostgreSQL logs if it keeps failing:
-  ```powershell
-  docker logs postgres-target --tail 30
-  ```
+# Windows PowerShell — filter for errors (no grep, use Select-String)
+docker logs kafka-connect --tail 100 2>&1 | Select-String -Pattern "ERROR|WARN|Exception"
 
-**Error: `Could not connect to postgres:5432`**
-- Verify PostgreSQL container is running: `docker compose ps postgres`
-- Verify connection from inside kafka-connect: `docker exec kafka-connect curl -s postgres:5432` (will return garbled bytes — that means port is reachable)
+# Linux / macOS
+docker logs kafka-connect --tail 100 2>&1 | grep -i "error\|exception\|failed"
+```
 
-**Sink shows `RUNNING` but no data in PostgreSQL**
-- Check consumer lag: `docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group connect-postgres-sink`
-- If lag is 0, data was processed. If lag is non-zero, the sink is behind — wait.
+---
 
-**Error: `primary key mode 'record_value' cannot have null schema` — sink tasks FAILED**
-- Cause: A tombstone message (null value) from a MySQL DELETE is in the topic. The Debezium JDBC sink crashes on null-value records.
-- Root fix: Ensure source connector has `drop.tombstones: true` (already set in the config above).
-- Recovery (if tombstones already exist in the topic):
-  ```powershell
-  # 1. Delete the sink connector
-  curl.exe -X DELETE http://localhost:8083/connectors/postgres-sink
+## Complete infrastructure teardown and restart
 
-  # 2. Reset consumer offsets to latest (skips all stuck tombstone messages)
-  docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --reset-offsets --group connect-postgres-sink --topic prod.mysql.sourcedb.orders --to-latest --execute
-  docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --reset-offsets --group connect-postgres-sink --topic prod.mysql.sourcedb.customers --to-latest --execute
+```bash
+# Stop and remove all containers + volumes (complete clean slate)
+docker compose down -v
 
-  # 3. Re-register the sink connector
-  curl.exe -X POST http://localhost:8083/connectors -H "Content-Type: application/json" -d "@connectors/sink/postgres-sink.json"
-  ```
-- After recovery, re-run any MySQL updates that were skipped.
+# Restart fresh
+docker compose up -d
+```
 
-**Error: sink RUNNING but 0 rows in PostgreSQL**
-- Cause 1: Old messages in topic were produced with `schemas.enable: false`. Sink needs schemas.
-  - Fix: Delete topics, delete connectors, recreate topics, re-register connectors.
-- Cause 2: Existing pipeline.orders/pipeline.customers tables have extra columns (`_cdc_op`, `_ingested_at`) that conflict with Debezium's auto-create.
-  - Fix: Drop those tables and let Debezium JDBC sink create them fresh with `schema.evolution: basic`.
-  ```powershell
-  docker exec postgres-target psql -U kafka_user -d targetdb -c "DROP TABLE IF EXISTS pipeline.orders; DROP TABLE IF EXISTS pipeline.customers;"
-  curl.exe -X POST http://localhost:8083/connectors/postgres-sink/restart?includeTasks=true
-  ```
+> **Warning:** `docker compose down -v` removes ALL data volumes including Kafka data, MySQL data, and PostgreSQL data. After this you need to recreate topics AND re-register connectors.
 
 ---
 
 ---
 
-# Phase 6: Python Producers/Consumers (Day 3)
-
-**Time estimate:** 30–45 minutes
+# Phase 10: Python Producer/Consumer Scripts
 
 ---
 
-## Step 6.1 — Create CSV to Kafka producer: `scripts/csv_producer.py`
+## Step 10.1 — Create CSV to Kafka producer: `scripts/csv_producer.py`
 
-This producer reads a CSV file row-by-row and publishes each row to a Kafka topic using Avro serialization.
+**What it does:** Reads a CSV file and publishes each row to a Kafka topic as a JSON message. Useful for loading bulk data files into the pipeline.
 
 ```python
 # scripts/csv_producer.py
@@ -1523,73 +1822,38 @@ import uuid
 import sys
 from pathlib import Path
 from confluent_kafka import Producer
-from confluent_kafka.schema_registry import SchemaRegistryClient
-from confluent_kafka.schema_registry.avro import AvroSerializer
-from confluent_kafka.serialization import SerializationContext, MessageField
 
 KAFKA_BOOTSTRAP = "localhost:9092"
-SCHEMA_REGISTRY_URL = "http://localhost:8081"
 TOPIC = "prod.files.csv.raw"
-
-# Avro schema — adjust field names to match your CSV headers
-AVRO_SCHEMA = """
-{
-  "type": "record",
-  "name": "CsvRow",
-  "namespace": "com.pipeline.files",
-  "fields": [
-    {"name": "id",           "type": ["null", "string"], "default": null},
-    {"name": "name",         "type": ["null", "string"], "default": null},
-    {"name": "amount",       "type": ["null", "string"], "default": null},
-    {"name": "created_at",   "type": ["null", "string"], "default": null},
-    {"name": "_source_file", "type": "string"},
-    {"name": "_row_number",  "type": "int"}
-  ]
-}
-"""
 
 def delivery_report(err, msg):
     if err:
         print(f"Delivery failed for row {msg.key()}: {err}")
-    # Uncomment for verbose success logging:
-    # else:
-    #     print(f"Delivered row to {msg.topic()}[{msg.partition()}] @ offset {msg.offset()}")
 
 def produce_csv(file_path: str):
-    sr_client = SchemaRegistryClient({"url": SCHEMA_REGISTRY_URL})
-    serializer = AvroSerializer(sr_client, AVRO_SCHEMA)
     producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
-
     file_name = Path(file_path).name
     row_num = 0
 
     with open(file_path, newline="", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
         for row_num, row in enumerate(reader, start=1):
-            # Build record — only include fields that exist in the schema
-            record = {
-                "id":           row.get("id"),
-                "name":         row.get("name"),
-                "amount":       row.get("amount"),
-                "created_at":   row.get("created_at"),
-                "_source_file": file_name,
-                "_row_number":  row_num,
-            }
+            row["_source_file"] = file_name
+            row["_row_number"] = row_num
 
             producer.produce(
                 topic=TOPIC,
                 key=str(uuid.uuid4()),
-                value=serializer(record, SerializationContext(TOPIC, MessageField.VALUE)),
+                value=json.dumps(row),
                 on_delivery=delivery_report
             )
 
-            # Poll to trigger delivery callbacks and prevent buffer overflow
             if row_num % 1000 == 0:
                 producer.poll(0)
                 print(f"Produced {row_num} rows...")
 
     producer.flush()
-    print(f"Finished. Produced {row_num} rows from {file_name} to topic {TOPIC}")
+    print(f"Done. Produced {row_num} rows from {file_name} to topic {TOPIC}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -1598,13 +1862,7 @@ if __name__ == "__main__":
     produce_csv(sys.argv[1])
 ```
 
-- [ ] `scripts/csv_producer.py` created
-
----
-
-## Step 6.2 — Create a sample CSV to test the producer
-
-Create `scripts/sample_data.csv`:
+Create a sample CSV to test it — `scripts/sample_data.csv`:
 
 ```csv
 id,name,amount,created_at
@@ -1613,67 +1871,58 @@ id,name,amount,created_at
 3,Widget C,9.99,2024-01-15 10:10:00
 ```
 
-- [ ] Sample CSV created
+Create the topic and run:
 
----
+```bash
+# Create topic
+docker exec kafka kafka-topics --create \
+  --bootstrap-server localhost:9092 \
+  --topic prod.files.csv.raw \
+  --partitions 3 --replication-factor 1 --if-not-exists
 
-## Step 6.3 — Create the CSV topic and run the producer
-
-First, create the topic for CSV data:
-
-```powershell
-docker exec kafka kafka-topics --create `
-  --bootstrap-server localhost:9092 `
-  --topic prod.files.csv.raw `
-  --partitions 3 `
-  --replication-factor 1 `
-  --if-not-exists
-```
-
-Then run the producer (make sure your venv is activated):
-
-```powershell
+# Run producer (venv must be activated)
 python scripts/csv_producer.py scripts/sample_data.csv
 ```
 
-Expected output:
-```
-Finished. Produced 3 rows from sample_data.csv to topic prod.files.csv.raw
-```
-
-- [ ] Producer ran without errors
-- [ ] Messages appear in Kafka UI under `prod.files.csv.raw`
-
 ---
 
-## Step 6.4 — Create custom Avro consumer: `consumers/postgres_consumer.py`
+## Step 10.2 — Create PostgreSQL consumer: `consumers/postgres_consumer.py`
 
-This consumer reads from the CDC orders topic and writes to PostgreSQL with UPSERT logic. It handles inserts, updates, and deletes correctly.
+**What it does:** Reads CDC events from Kafka and writes them to PostgreSQL with proper INSERT/UPDATE/DELETE handling. Unlike the JDBC Sink connector, this Python consumer can do **hard deletes** (physically removes rows for `__op = "d"`).
 
-First, create the `consumers/` directory:
-
-```powershell
-mkdir consumers
+**Option A — Docker PostgreSQL:**
+```python
+PG_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "targetdb",
+    "user": "kafka_user",
+    "password": "kafka_password",
+}
 ```
 
-Then create `consumers/postgres_consumer.py`:
+**Option B — VPS PostgreSQL:**
+```python
+PG_CONFIG = {
+    "host": "YOUR_VPS_IP",
+    "port": 5432,
+    "dbname": "targetdb",
+    "user": "kafka_user",
+    "password": "YOUR_PASSWORD",
+}
+```
 
 ```python
 # consumers/postgres_consumer.py
+import json
 import psycopg2
 import psycopg2.extras
 import logging
 import signal
 import sys
 from confluent_kafka import Consumer, KafkaError
-from confluent_kafka.schema_registry import SchemaRegistryClient
-from confluent_kafka.schema_registry.avro import AvroDeserializer
-from confluent_kafka.serialization import SerializationContext, MessageField
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 KAFKA_CONFIG = {
@@ -1681,14 +1930,10 @@ KAFKA_CONFIG = {
     "group.id": "custom-postgres-consumer",
     "auto.offset.reset": "earliest",
     "enable.auto.commit": False,
-    "max.poll.interval.ms": 300000,
-    "session.timeout.ms": 30000,
 }
 
-SCHEMA_REGISTRY_URL = "http://localhost:8081"
-TOPICS = ["prod.mysql.sourcedb.orders"]
-BATCH_SIZE = 500
-
+# Option A (Docker): use kafka_password
+# Option B (VPS):    use your VPS password
 PG_CONFIG = {
     "host": "localhost",
     "port": 5432,
@@ -1697,21 +1942,22 @@ PG_CONFIG = {
     "password": "kafka_password",
 }
 
+TOPICS = ["prod.mysql.sourcedb.orders"]
+BATCH_SIZE = 500
+
 UPSERT_SQL = """
 INSERT INTO pipeline.orders
-    (id, customer_id, product_id, quantity, amount, status, created_at, updated_at, _cdc_op, _ingested_at)
+    (id, customer_id, product_id, quantity, amount, status, created_at, updated_at)
 VALUES
     (%(id)s, %(customer_id)s, %(product_id)s, %(quantity)s, %(amount)s,
-     %(status)s, %(created_at)s, %(updated_at)s, %(__op)s, NOW())
+     %(status)s, %(created_at)s, %(updated_at)s)
 ON CONFLICT (id) DO UPDATE SET
     customer_id  = EXCLUDED.customer_id,
     product_id   = EXCLUDED.product_id,
     quantity     = EXCLUDED.quantity,
     amount       = EXCLUDED.amount,
     status       = EXCLUDED.status,
-    updated_at   = EXCLUDED.updated_at,
-    _cdc_op      = EXCLUDED._cdc_op,
-    _ingested_at = NOW();
+    updated_at   = EXCLUDED.updated_at;
 """
 
 DELETE_SQL = "DELETE FROM pipeline.orders WHERE id = %(id)s"
@@ -1723,36 +1969,40 @@ def signal_handler(sig, frame):
     logger.info("Shutdown signal received — stopping after current batch")
     running = False
 
+def extract_payload(msg_value):
+    """Extract payload from either {schema, payload} or flat format."""
+    try:
+        data = json.loads(msg_value)
+        if "payload" in data:
+            return data["payload"]
+        return data
+    except Exception:
+        return None
+
 def process_batch(conn, batch):
     upserts = [r for r in batch if r.get("__op") != "d"]
     deletes = [r for r in batch if r.get("__op") == "d"]
-
     with conn.cursor() as cur:
         if upserts:
             psycopg2.extras.execute_batch(cur, UPSERT_SQL, upserts, page_size=200)
         if deletes:
             psycopg2.extras.execute_batch(cur, DELETE_SQL, deletes, page_size=200)
-
     conn.commit()
-    logger.info(f"Processed batch: {len(upserts)} upserts, {len(deletes)} deletes")
+    logger.info(f"Batch: {len(upserts)} upserts, {len(deletes)} hard deletes")
 
 def main():
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    sr_client = SchemaRegistryClient({"url": SCHEMA_REGISTRY_URL})
-    deserializer = AvroDeserializer(sr_client)
     consumer = Consumer(KAFKA_CONFIG)
     consumer.subscribe(TOPICS)
     conn = psycopg2.connect(**PG_CONFIG)
-
     batch = []
     offsets_to_commit = []
 
     try:
         while running:
             msg = consumer.poll(timeout=1.0)
-
             if msg is None:
                 if batch:
                     process_batch(conn, batch)
@@ -1760,20 +2010,14 @@ def main():
                     batch.clear()
                     offsets_to_commit.clear()
                 continue
-
             if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    continue
-                logger.error(f"Consumer error: {msg.error()}")
+                if msg.error().code() != KafkaError._PARTITION_EOF:
+                    logger.error(f"Consumer error: {msg.error()}")
                 continue
 
-            value = deserializer(
-                msg.value(),
-                SerializationContext(msg.topic(), MessageField.VALUE)
-            )
-
-            if value:
-                batch.append(value)
+            payload = extract_payload(msg.value())
+            if payload:
+                batch.append(payload)
                 offsets_to_commit.append(msg)
 
             if len(batch) >= BATCH_SIZE:
@@ -1801,414 +2045,28 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] `consumers/postgres_consumer.py` created
+Run:
 
----
-
-## Step 6.5 — Run the custom consumer
-
-Make sure your venv is activated, then:
-
-```powershell
+```bash
+# venv must be activated
 python consumers/postgres_consumer.py
+# Press Ctrl+C to stop
 ```
 
-Expected output (it will keep running until you press Ctrl+C):
-
-```
-2024-01-15 10:00:00 INFO Processed batch: 2 upserts, 0 deletes
-```
-
-Stop it with `Ctrl+C` when done testing.
-
-- [ ] Consumer runs and processes messages
-- [ ] Data appears in `pipeline.orders` table
-
 ---
 
-## Common Errors — Phase 6
+## Step 10.3 — Create load test: `scripts/load_test.py`
 
-**Error: `ModuleNotFoundError: No module named 'confluent_kafka'`**
-- Your venv is not activated. Run `.\.venv\Scripts\Activate.ps1` first.
-
-**Error: `Schema Registry connection refused`**
-- Verify Schema Registry is running: `curl http://localhost:8081/subjects`
-- The producer connects to `localhost:8081` (host machine), which maps to the Schema Registry container.
-
-**Error: `SSL: CERTIFICATE_VERIFY_FAILED` on Windows**
-- Not expected in this dev setup (no TLS configured). If it appears, check if you have a proxy intercepting traffic.
-
-**CSV producer fails with `KeyError: 'id'`**
-- Your CSV file headers don't match the Avro schema field names. Edit `AVRO_SCHEMA` in `csv_producer.py` to match your actual CSV columns.
-
----
-
----
-
-# Phase 7: Monitoring (Day 4)
-
-**Time estimate:** 20–30 minutes
-
----
-
-## Step 7.1 — Verify Prometheus is collecting metrics
-
-Open http://localhost:9090 in your browser.
-
-1. Click **Status** → **Targets**
-2. You should see these scrape targets:
-   - `kafka` at `kafka:7071` — may show as DOWN initially (JMX not configured yet — see note below)
-   - `kafka-exporter` at `kafka-exporter:9308` — should be UP
-   - `kafka-connect` at `kafka-connect:7072` — may show as DOWN
-
-> **Note:** The `kafka:7071` JMX exporter requires additional JMX exporter agent configuration on the Kafka container to serve metrics in Prometheus format. For this dev setup, the most useful metrics come from `kafka-exporter` (consumer lag, topic metrics). JMX exporter setup is covered in `09-monitoring.md` for production deployments.
-
-The `kafka-exporter` target should be UP and collecting:
-
-```promql
-# Test in Prometheus query box
-kafka_consumergroup_lag
-```
-
-- [ ] Prometheus is accessible at http://localhost:9090
-- [ ] `kafka-exporter` target is UP
-
----
-
-## Step 7.2 — Access Grafana
-
-Open http://localhost:3000
-
-Login credentials:
-- Username: `admin`
-- Password: `admin`
-
-You will be prompted to change the password on first login — you can skip this for dev.
-
-- [ ] Grafana accessible at http://localhost:3000
-
----
-
-## Step 7.3 — Add Prometheus as a data source in Grafana
-
-1. In Grafana, click the hamburger menu (top left) → **Connections** → **Data sources**
-2. Click **Add data source**
-3. Select **Prometheus**
-4. Set the URL to: `http://prometheus:9090`
-   - Use `prometheus` (the Docker container hostname), not `localhost`
-5. Click **Save & test**
-6. You should see "Data source is working"
-
-- [ ] Prometheus data source added to Grafana
-
----
-
-## Step 7.4 — Import a Kafka dashboard
-
-1. In Grafana, click the **+** icon → **Import**
-2. Enter Dashboard ID: **7589** (Kafka Exporter Overview)
-3. Click **Load**
-4. Select the Prometheus data source you just added
-5. Click **Import**
-
-This dashboard shows:
-- Message in/out rates per topic
-- Consumer group lag
-- Active consumer group count
-- Topic partition count
-
-Useful additional dashboard IDs:
-- `11173` — Kafka Connect metrics
-- `14012` — Kafka Lag Exporter
-- `8563` — JVM Overview
-
-- [ ] Dashboard 7589 imported and showing data
-
----
-
-## Step 7.5 — Key metrics to watch
-
-Once the dashboard loads, look for these indicators:
-
-**Consumer Lag (most important)**
-```promql
-sum by (consumergroup, topic) (kafka_consumergroup_lag)
-```
-- Should be 0 or near-0 when the pipeline is idle
-- Increases during high insert load, then returns to 0
-
-**Messages produced per second**
-```promql
-rate(kafka_topic_partition_current_offset[1m])
-```
-
-**Consumer group health**
-```promql
-kafka_consumergroup_members
-```
-- `connect-mysql-cdc-source` should have 1 member
-- `connect-postgres-sink` should have members equal to `tasks.max` (2)
-
-**Connector task failures (via Connect REST API)**
-```powershell
-curl http://localhost:8083/connectors/mysql-cdc-source/status
-curl http://localhost:8083/connectors/postgres-sink/status
-```
-
-- [ ] Consumer lag metric is visible in Grafana
-
----
-
-## Common Errors — Phase 7
-
-**Grafana shows "No data" on all panels**
-- Verify the data source URL is `http://prometheus:9090` (not `localhost:9090`)
-- Click the data source and run "Save & test" again
-
-**Kafka exporter shows as DOWN in Prometheus targets**
-- Verify it's running: `docker compose ps kafka-exporter`
-- Check logs: `docker logs kafka-exporter --tail 20`
-- It may fail if Kafka isn't ready. Restart it: `docker compose restart kafka-exporter`
-
-**Prometheus target `kafka:7071` is always DOWN**
-- This requires the JMX Prometheus exporter agent to be configured inside the Kafka container. This is an advanced setup. For basic monitoring, `kafka-exporter:9308` is sufficient.
-
----
-
----
-
-# Phase 8: Testing the Full Pipeline (Day 4)
-
-**Time estimate:** 30–45 minutes
-
----
-
-## Step 8.1 — Insert test data into MySQL and watch it appear in Kafka
-
-Open two terminal windows side by side.
-
-**Terminal 1** — watch Kafka topic messages in real-time:
-
-```powershell
-docker exec kafka kafka-console-consumer `
-  --bootstrap-server localhost:9092 `
-  --topic prod.mysql.sourcedb.orders `
-  --from-beginning `
-  --property print.headers=true
-```
-
-**Terminal 2** — insert test data into MySQL:
-
-```powershell
-docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "
-INSERT INTO orders (customer_id, product_id, quantity, amount, status)
-VALUES (1, 201, 3, 149.99, 'PENDING');
-"
-```
-
-Expected: Within 1–2 seconds, Terminal 1 should print a new Avro-encoded message (will appear as garbled binary — that is expected for Avro). Use Kafka UI for readable output.
-
-**In Kafka UI:**
-1. Open http://localhost:8090 → **Topics** → `prod.mysql.sourcedb.orders`
-2. Click **Messages** tab
-3. You should see the new message with `__op: "c"` (create)
-
-- [ ] New MySQL insert appears in Kafka topic within 2 seconds
-
----
-
-## Step 8.2 — Verify it lands in PostgreSQL
-
-After the insert, wait 3–5 seconds, then:
-
-```powershell
-docker exec postgres-target psql -U kafka_user -d targetdb -c "
-SELECT id, customer_id, amount, status, _ingested_at
-FROM pipeline.orders
-ORDER BY id DESC
-LIMIT 5;
-"
-```
-
-You should see the new row with `status = 'PENDING'`.
-
-- [ ] New order appears in PostgreSQL
-
----
-
-## Step 8.3 — Test an UPDATE
-
-```powershell
-docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "
-UPDATE orders SET status = 'PROCESSING' WHERE customer_id = 1 AND status = 'PENDING';
-"
-```
-
-Wait 3 seconds, then verify in PostgreSQL:
-
-```powershell
-docker exec postgres-target psql -U kafka_user -d targetdb -c "
-SELECT id, status FROM pipeline.orders WHERE status = 'PROCESSING';
-"
-```
-
-In Kafka UI, the new message should show `__op: "u"` (update).
-
-- [ ] UPDATE propagates from MySQL to PostgreSQL
-
----
-
-## Step 8.4 — Test a DELETE
-
-```powershell
-# Get the ID of the order we just inserted
-docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "
-SELECT id FROM orders ORDER BY id DESC LIMIT 1;
-"
-
-# Delete it (replace <ID> with the actual ID)
-docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "
-DELETE FROM orders WHERE id = <ID>;
-"
-```
-
-Wait 3 seconds, then verify:
-
-```powershell
-docker exec postgres-target psql -U kafka_user -d targetdb -c "
-SELECT COUNT(*) FROM pipeline.orders WHERE id = <ID>;
-"
-```
-
-Expected: `0`
-
-> **Note:** For DELETE to work, the JDBC Sink Connector must be configured with `delete.enabled: true` and tombstone handling. The current `postgres-sink.json` uses upsert mode only. To enable deletes, see `06-data-sink.md` "With Delete Support" section. For this test, the `__op` field is set to `"d"` — you can verify with the custom consumer in Phase 6 which handles deletes explicitly.
-
-- [ ] DELETE message appears in Kafka with `__op: "d"`
-
----
-
-## Step 8.5 — Test failure and recovery (DLQ scenario)
-
-**Test 1: Sink failure and Kafka durability**
-
-```powershell
-# 1. Stop PostgreSQL
-docker compose stop postgres
-
-# 2. Insert data into MySQL while PG is down
-docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "
-INSERT INTO orders (customer_id, product_id, quantity, amount, status)
-VALUES (2, 888, 5, 499.99, 'RECOVERY_TEST');
-"
-
-# 3. Data is safely stored in Kafka
-echo "Data is in Kafka. PostgreSQL is down."
-
-# 4. Restart PostgreSQL
-docker compose start postgres
-
-# 5. Wait for sink connector to auto-recover (~30s)
-# Watch connector status
-curl http://localhost:8083/connectors/postgres-sink/status
-
-# 6. Verify data appeared after recovery
-docker exec postgres-target psql -U kafka_user -d targetdb -c "
-SELECT * FROM pipeline.orders WHERE amount = 499.99;
-"
-```
-
-Expected: The row with `amount = 499.99` appears in PostgreSQL after PostgreSQL comes back up. This demonstrates **Kafka as a durable buffer** — no data loss even when the sink is temporarily unavailable.
-
-- [ ] Data written to MySQL while PG is down eventually lands in PostgreSQL after recovery
-
----
-
-## Step 8.6 — Test source failure recovery
-
-```powershell
-# 1. Stop MySQL
-docker compose stop mysql
-
-# 2. Watch connector status change (wait ~30s for FAILED)
-curl http://localhost:8083/connectors/mysql-cdc-source/status
-
-# 3. Restart MySQL
-docker compose start mysql
-
-# 4. Wait for Debezium to auto-reconnect (~30s)
-# Check connector status
-curl http://localhost:8083/connectors/mysql-cdc-source/status
-
-# 5. If still FAILED, restart the connector manually
-curl -X POST http://localhost:8083/connectors/mysql-cdc-source/restart
-
-# 6. Insert a record to confirm streaming resumed
-docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "
-INSERT INTO orders (customer_id, product_id, quantity, amount, status)
-VALUES (1, 999, 1, 299.99, 'POST_RECOVERY');
-"
-
-# 7. Verify it appears in PostgreSQL
-docker exec postgres-target psql -U kafka_user -d targetdb -c "
-SELECT * FROM pipeline.orders WHERE status = 'POST_RECOVERY';
-"
-```
-
-- [ ] CDC resumes after MySQL restart
-
----
-
-## Step 8.7 — Check the DLQ topic
-
-After the failure tests, check if anything ended up in the DLQ:
-
-```powershell
-docker exec kafka kafka-console-consumer `
-  --bootstrap-server localhost:9092 `
-  --topic prod.dlq.errors `
-  --from-beginning `
-  --max-messages 10 `
-  --timeout-ms 5000
-```
-
-In a healthy pipeline with valid data, the DLQ should be empty. Any messages here indicate records that failed processing and need investigation.
-
-- [ ] DLQ is empty (or any messages are understood and handled)
-
----
-
-## Step 8.8 — Watch consumer lag during load
-
-```powershell
-# Monitor consumer lag in real-time
-docker exec kafka kafka-consumer-groups `
-  --bootstrap-server localhost:9092 `
-  --describe `
-  --group connect-postgres-sink
-```
-
-The `LAG` column shows how many messages the sink is behind. During normal operation it should be 0. During bulk inserts it will increase and then drain back to 0.
-
-- [ ] Consumer lag returns to 0 after bulk insert
-
----
-
-## Step 8.9 — Run a load test (optional)
-
-Create `scripts/load_test.py`:
+**What it does:** Inserts 1000 orders into MySQL in batches and measures end-to-end pipeline latency.
 
 ```python
 # scripts/load_test.py
-"""
-Inserts 1000 orders into MySQL in batches of 100
-and measures pipeline end-to-end latency.
-"""
 import mysql.connector
 import psycopg2
 import time
 import random
 
+# Option A (Docker MySQL on port 3307, Docker PostgreSQL on port 5432)
 MYSQL_CONFIG = {
     "host": "localhost", "port": 3307,
     "database": "sourcedb",
@@ -2220,6 +2078,10 @@ PG_CONFIG = {
     "user": "kafka_user", "password": "kafka_password"
 }
 
+# Option B (VPS — change host and password)
+# MYSQL_CONFIG = {"host": "YOUR_VPS_IP", "port": 3306, ...}
+# PG_CONFIG = {"host": "YOUR_VPS_IP", "port": 5432, ...}
+
 NUM_ORDERS = 1000
 BATCH_SIZE = 100
 
@@ -2229,7 +2091,7 @@ def run_load_test():
     mysql_cur = mysql_conn.cursor()
     pg_cur = pg_conn.cursor()
 
-    print(f"Inserting {NUM_ORDERS} orders into MySQL in batches of {BATCH_SIZE}...")
+    print(f"Inserting {NUM_ORDERS} orders into MySQL...")
     start_time = time.time()
 
     for batch_start in range(0, NUM_ORDERS, BATCH_SIZE):
@@ -2244,15 +2106,12 @@ def run_load_test():
             batch
         )
         mysql_conn.commit()
-        print(f"  Inserted {batch_start + BATCH_SIZE}/{NUM_ORDERS} orders...")
+        print(f"  Inserted {batch_start + BATCH_SIZE}/{NUM_ORDERS}")
 
-    insert_done_time = time.time()
-    print(f"MySQL inserts done in {insert_done_time - start_time:.2f}s")
-
-    # Get the max ID that was inserted
+    insert_done = time.time()
     mysql_cur.execute("SELECT MAX(id) FROM orders")
     max_id = mysql_cur.fetchone()[0]
-    print(f"Waiting for PostgreSQL to catch up (max_id={max_id})...")
+    print(f"MySQL inserts done in {insert_done - start_time:.2f}s. Waiting for sync...")
 
     wait_start = time.time()
     while True:
@@ -2262,17 +2121,14 @@ def run_load_test():
             break
         elapsed = time.time() - wait_start
         if elapsed > 120:
-            print("Timeout waiting for sync!")
+            print("Timeout!")
             break
-        print(f"  PG max_id={pg_max}, waiting... ({elapsed:.1f}s)")
+        print(f"  PG max_id={pg_max} (target={max_id}), {elapsed:.1f}s...")
         time.sleep(1)
 
-    total_time = time.time() - start_time
-    sync_latency = time.time() - insert_done_time
-    print(f"\nResults:")
-    print(f"  Total time (insert + sync): {total_time:.2f}s")
-    print(f"  Pipeline sync latency: {sync_latency:.2f}s")
-    print(f"  Throughput: {NUM_ORDERS / total_time:.0f} events/sec end-to-end")
+    total = time.time() - start_time
+    sync_lat = time.time() - insert_done
+    print(f"\nResults: total={total:.2f}s, sync_latency={sync_lat:.2f}s, throughput={NUM_ORDERS/total:.0f} events/sec")
 
     mysql_conn.close()
     pg_conn.close()
@@ -2281,214 +2137,237 @@ if __name__ == "__main__":
     run_load_test()
 ```
 
-Run it:
-
-```powershell
+```bash
 python scripts/load_test.py
 ```
 
-Expected results on a typical dev machine:
-- Insert rate: ~500–2000 rows/sec into MySQL
-- Pipeline sync latency: 2–10 seconds for 1000 rows
-- End-to-end throughput: 100–500 events/sec (single-node dev)
+---
 
-- [ ] Load test completes with sync latency under 30 seconds
+---
+
+# Phase 11: Monitoring
+
+---
+
+## Step 11.1 — Access Prometheus
+
+Open http://localhost:9090 → **Status** → **Targets**
+
+You should see:
+- `kafka-exporter` at `kafka-exporter:9308` → **UP** (consumer lag, topic metrics)
+- `kafka-connect` at `kafka-connect:7072` → **DOWN** (expected — Debezium image doesn't expose this port)
+
+The `kafka-exporter` being UP is what matters. The `kafka-connect` DOWN is harmless.
+
+---
+
+## Step 11.2 — Set up Grafana
+
+1. Open http://localhost:3000
+2. Login: username `admin`, password `admin` (skip the change password prompt for dev)
+3. Click hamburger menu → **Connections** → **Data sources** → **Add data source**
+4. Select **Prometheus**
+5. URL: `http://prometheus:9090` (use container hostname, not `localhost`)
+6. Click **Save & test** → "Data source is working"
+
+---
+
+## Step 11.3 — Import Kafka dashboard
+
+1. Click **+** → **Import**
+2. Enter Dashboard ID: **7589** (Kafka Exporter Overview)
+3. Click **Load** → select your Prometheus data source → **Import**
+
+Key metrics to watch:
+
+```promql
+# Consumer lag — should be 0 at rest
+sum by (consumergroup, topic) (kafka_consumergroup_lag)
+
+# Messages per second
+rate(kafka_topic_partition_current_offset[1m])
+
+# Consumer group members
+kafka_consumergroup_members
+```
 
 ---
 
 ---
 
-# Quick Reference: Common Commands
+# Phase 12: End-to-End Testing
 
-## Service Management
+---
+
+## Step 12.1 — Test INSERT
+
+**Option A (Docker MySQL):**
 
 ```powershell
-# Start all services
-docker compose up -d
-
-# Stop all services (keeps data volumes)
-docker compose down
-
-# Stop and DELETE all data (clean slate)
-docker compose down -v
-
-# View logs for a specific service
-docker compose logs -f kafka-connect
-
-# Restart a single service
-docker compose restart kafka-connect
-
-# Check service health
-docker compose ps
+docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "
+INSERT INTO orders (customer_id, product_id, quantity, amount, status)
+VALUES (1, 201, 3, 149.99, 'PENDING');"
 ```
 
-## Connector Management
+**Option B (VPS MySQL — on VPS):**
 
-```powershell
-# List all connectors
-curl http://localhost:8083/connectors
-
-# Check connector status
-curl http://localhost:8083/connectors/mysql-cdc-source/status
-curl http://localhost:8083/connectors/postgres-sink/status
-
-# Restart a connector (after fixing a config error)
-curl -X POST http://localhost:8083/connectors/mysql-cdc-source/restart
-
-# Pause a connector
-curl -X PUT http://localhost:8083/connectors/postgres-sink/pause
-
-# Resume a connector
-curl -X PUT http://localhost:8083/connectors/postgres-sink/resume
-
-# Delete a connector
-curl -X DELETE http://localhost:8083/connectors/postgres-sink
-
-# Update connector config
-curl -X PUT http://localhost:8083/connectors/postgres-sink/config `
-  -H "Content-Type: application/json" `
-  -d "{""batch.size"": ""5000""}"
+```bash
+mysql -u kafka_user -p'YOUR_PASSWORD' sourcedb -e "
+INSERT INTO orders (customer_id, product_id, quantity, amount, status)
+VALUES (1, 201, 3, 149.99, 'PENDING');"
 ```
 
-## Kafka CLI
+Wait 3–5 seconds, then verify in PostgreSQL.
+
+---
+
+## Step 12.2 — Test UPDATE
+
+```bash
+# Option A (Docker MySQL)
+docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e \
+  "UPDATE orders SET status = 'COMPLETED', product_id = 999 WHERE id = 1;"
+
+# Option B (VPS MySQL — on VPS)
+mysql -u kafka_user -p'YOUR_PASSWORD' sourcedb -e \
+  "UPDATE orders SET status = 'COMPLETED', product_id = 999 WHERE id = 1;"
+```
+
+> **MySQL no-op UPDATE rule:** MySQL does NOT generate a binlog event if the UPDATE doesn't actually change any column value. Always update to a genuinely different value, otherwise no CDC event is produced and nothing appears in Kafka.
+
+---
+
+## Step 12.3 — Watch Kafka topic in real-time
+
+**Windows PowerShell:**
 
 ```powershell
-# List topics
-docker exec kafka kafka-topics --list --bootstrap-server localhost:9092
-
-# Describe a topic (partitions, replication, config)
-docker exec kafka kafka-topics --describe `
+docker exec kafka kafka-console-consumer `
+  --bootstrap-server localhost:9092 `
   --topic prod.mysql.sourcedb.orders `
-  --bootstrap-server localhost:9092
+  --from-beginning `
+  --timeout-ms 30000
+```
 
-# Check consumer group lag
+**Linux / macOS:**
+
+```bash
+docker exec kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic prod.mysql.sourcedb.orders \
+  --from-beginning \
+  --timeout-ms 30000
+```
+
+Each message will be a large JSON with `"schema"` and `"payload"` sections. The `"payload"."__op"` field shows the operation: `"c"` = create, `"u"` = update, `"d"` = delete.
+
+---
+
+## Step 12.4 — Monitor consumer lag
+
+```bash
+# Windows PowerShell
 docker exec kafka kafka-consumer-groups `
   --bootstrap-server localhost:9092 `
   --describe `
   --group connect-postgres-sink
 
-# Consume messages from beginning (for debugging)
+# Linux / macOS
+docker exec kafka kafka-consumer-groups \
+  --bootstrap-server localhost:9092 \
+  --describe \
+  --group connect-postgres-sink
+```
+
+`LAG` should be 0 during idle. It increases during bulk inserts and returns to 0.
+
+---
+
+## Step 12.5 — Check DLQ for failed messages
+
+```bash
+# Windows PowerShell
 docker exec kafka kafka-console-consumer `
   --bootstrap-server localhost:9092 `
-  --topic prod.mysql.sourcedb.orders `
+  --topic prod.dlq.errors `
   --from-beginning `
-  --max-messages 10
+  --max-messages 10 `
+  --timeout-ms 5000
 
-# List all consumer groups
-docker exec kafka kafka-consumer-groups `
-  --bootstrap-server localhost:9092 `
-  --list
+# Linux / macOS
+docker exec kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic prod.dlq.errors \
+  --from-beginning \
+  --max-messages 10 \
+  --timeout-ms 5000
 ```
 
-## Database Quick Access
+A healthy pipeline's DLQ should be empty. Messages here indicate records that failed processing and need investigation.
 
-```powershell
-# Connect to MySQL
-docker exec -it mysql-source mysql -u kafka_user -pkafka_password sourcedb
+---
 
-# Connect to PostgreSQL
-docker exec -it postgres-target psql -U kafka_user -d targetdb
+---
 
-# Quick query without interactive shell
-docker exec mysql-source mysql -u kafka_user -pkafka_password sourcedb -e "SELECT COUNT(*) FROM orders;"
-docker exec postgres-target psql -U kafka_user -d targetdb -c "SELECT COUNT(*) FROM pipeline.orders;"
+# Quick Reference
+
+## All connector REST API commands
+
+```bash
+# List all connectors
+curl.exe http://localhost:8083/connectors
+
+# Check source status
+curl.exe http://localhost:8083/connectors/mysql-cdc-source/status
+
+# Check sink status
+curl.exe http://localhost:8083/connectors/postgres-sink/status
+
+# Register source
+curl.exe -X POST http://localhost:8083/connectors -H "Content-Type: application/json" -d "@connectors/source/mysql-cdc-source.json"
+
+# Register sink
+curl.exe -X POST http://localhost:8083/connectors -H "Content-Type: application/json" -d "@connectors/sink/postgres-sink.json"
+
+# Delete source
+curl.exe -X DELETE http://localhost:8083/connectors/mysql-cdc-source
+
+# Delete sink
+curl.exe -X DELETE http://localhost:8083/connectors/postgres-sink
+
+# Restart a failed connector
+curl.exe -X POST "http://localhost:8083/connectors/postgres-sink/restart?includeTasks=true"
 ```
 
-## Schema Registry
+> On **Linux/macOS**, replace `curl.exe` with `curl`.
 
-```powershell
-# List all registered schemas
-curl http://localhost:8081/subjects
+## Docker Compose commands
 
-# Get schema versions for a topic
-curl http://localhost:8081/subjects/prod.mysql.sourcedb.orders-value/versions
-
-# Get latest schema
-curl http://localhost:8081/subjects/prod.mysql.sourcedb.orders-value/versions/latest
+```bash
+docker compose up -d           # Start all containers (background)
+docker compose down            # Stop all containers (keep volumes)
+docker compose down -v         # Stop + delete all data volumes (clean slate)
+docker compose ps              # List container status
+docker compose restart kafka-connect   # Restart one service
+docker logs kafka-connect --tail 50    # View recent logs
 ```
 
----
+## Common diagnostic checks
 
----
+```bash
+# Is Kafka ready?
+curl.exe http://localhost:8083/
 
-# Final Checklist — Complete Pipeline
+# Are connectors running?
+curl.exe http://localhost:8083/connectors
 
-After completing all 8 phases, verify the full end-to-end pipeline:
+# How many messages in a topic?
+docker exec kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list localhost:9092 --topic prod.mysql.sourcedb.orders
 
-## Infrastructure
-- [ ] All 9 Docker containers running and healthy
-- [ ] Kafka UI accessible at http://localhost:8090
-- [ ] Schema Registry accessible at http://localhost:8081
-- [ ] Kafka Connect REST API accessible at http://localhost:8083
-- [ ] Prometheus accessible at http://localhost:9090
-- [ ] Grafana accessible at http://localhost:3000
+# Consumer group lag
+docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group connect-postgres-sink
 
-## Topics
-- [ ] `prod.mysql.sourcedb.orders` exists (3 partitions)
-- [ ] `prod.mysql.sourcedb.customers` exists (3 partitions)
-- [ ] `prod.dlq.errors` exists (1 partition, infinite retention)
-- [ ] `_connect-configs`, `_connect-offsets`, `_connect-status` exist
-
-## Connectors
-- [ ] `mysql-cdc-source` connector is RUNNING
-- [ ] `postgres-sink` connector is RUNNING
-- [ ] Both connectors show 0 failed tasks
-
-## Data Flow
-- [ ] MySQL seed data (2 orders, 2 customers) visible in Kafka topics
-- [ ] MySQL seed data visible in PostgreSQL target tables
-- [ ] New MySQL INSERT appears in Kafka within 2 seconds
-- [ ] New MySQL INSERT appears in PostgreSQL within 5 seconds
-- [ ] MySQL UPDATE propagates to PostgreSQL
-- [ ] Pipeline recovers automatically after PostgreSQL restart
-
-## Monitoring
-- [ ] Prometheus is scraping `kafka-exporter` successfully
-- [ ] Grafana dashboard 7589 shows topic and consumer group metrics
-- [ ] Consumer lag is 0 during idle periods
-
----
-
----
-
-# Troubleshooting Index
-
-| Symptom | Phase | Fix |
-|---------|-------|-----|
-| kafka-connect keeps restarting | 2 | Wait 2–3 min; Kafka/SR not ready |
-| Port already in use | 2 | Stop local service or change port in docker-compose.yml |
-| Out of memory errors | 2 | Increase Docker Desktop memory to 8 GB |
-| `CLUSTER_ID` mismatch | 2 | `docker compose down -v` then restart |
-| Connector state FAILED | 4/5 | Check `docker logs kafka-connect`; check credentials |
-| `JdbcSinkConnector not found` | 5 | Use `io.debezium.connector.jdbc.JdbcSinkConnector` not Confluent class |
-| No data in PostgreSQL | 5 | Check consumer lag; verify connector RUNNING |
-| ModuleNotFoundError | 6 | Activate venv: `.\.venv\Scripts\Activate.ps1` |
-| Consumer lag never returns to 0 | 8 | Increase `tasks.max` in sink connector config |
-| DLQ has messages | 8 | Inspect with `kafka-console-consumer` to find root cause |
-| `schemas.enable: false` on source/sink | 4/5 | Set both key and value schemas.enable to true in both connectors |
-| `drop.tombstones: false` | 4 | Set drop.tombstones: true in source connector; reset sink offsets to recover |
-| Tombstones crash sink tasks | 5 | Delete sink, reset offsets to latest, re-register sink |
-| MySQL no-op UPDATE not captured | 4 | MySQL skips binlog for no-change UPDATEs — always update to a different value |
-| `UNKNOWN_TOPIC_OR_PARTITION: prod.mysql` | 3 | Create prod.mysql and __debezium-heartbeat.prod.mysql topics |
-
----
-
-# Reference Documents
-
-All detailed documentation is in the `Documents/` directory:
-
-| File | Contents |
-|------|----------|
-| `01-architecture.md` | System architecture diagrams and component breakdown |
-| `02-technology-stack.md` | Technology choices, sizing guides, connector ecosystem |
-| `03-environment-setup.md` | Docker Compose reference, KRaft config, CLI commands |
-| `04-data-ingestion.md` | Debezium CDC configs (MySQL, PostgreSQL, Oracle), CSV producer |
-| `05-data-processing.md` | Kafka Streams, ksqlDB, Flink examples |
-| `06-data-sink.md` | JDBC Sink configs (PostgreSQL, MySQL, SQL Server), custom consumer |
-| `07-schema-management.md` | Avro/Protobuf/JSON schema examples, Schema Registry API |
-| `08-error-handling.md` | DLQ, retry strategies, exactly-once, idempotent sinks |
-| `09-monitoring.md` | Prometheus queries, alert rules, Grafana dashboards |
-| `10-security.md` | TLS, SASL/SCRAM, ACLs, secrets management |
-| `11-scaling-performance.md` | Partition tuning, broker/producer/consumer config |
-| `12-deployment.md` | Kubernetes (Strimzi/Helm), CI/CD pipeline |
-| `13-real-world-example.md` | End-to-end walkthrough with load test and failure scenarios |
+# Check VPS connectivity
+Test-NetConnection -ComputerName YOUR_VPS_IP -Port 3306
+Test-NetConnection -ComputerName YOUR_VPS_IP -Port 5432
+```

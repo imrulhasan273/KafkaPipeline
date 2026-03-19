@@ -79,16 +79,10 @@ services:
       CONFIG_STORAGE_REPLICATION_FACTOR: 1
       OFFSET_STORAGE_REPLICATION_FACTOR: 1
       STATUS_STORAGE_REPLICATION_FACTOR: 1
-      # KEY_CONVERTER: "io.confluent.connect.avro.AvroConverter"
-      # VALUE_CONVERTER: "io.confluent.connect.avro.AvroConverter"
-      # KEY_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
-      # VALUE_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
-      # REPLACE with these 4 lines
       KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
       VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
       KEY_CONVERTER_SCHEMAS_ENABLE: "false"
       VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
-      #
       CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
       CONNECT_PLUGIN_PATH: "/kafka/connect,/usr/share/confluent-hub-components"
     volumes:
@@ -115,45 +109,6 @@ services:
       KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
       KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
 
-  mysql:
-    image: mysql:8.0
-    container_name: mysql-source
-    ports:
-      - "3307:3306"
-    environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: sourcedb
-      MYSQL_USER: kafka_user
-      MYSQL_PASSWORD: kafka_password
-    command: >
-      --log-bin=mysql-bin
-      --binlog-format=ROW
-      --binlog-row-image=FULL
-      --gtid-mode=ON
-      --enforce-gtid-consistency=ON
-      --server-id=1
-    volumes:
-      - mysql-data:/var/lib/mysql
-      - ./scripts/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql
-
-  postgres:
-    image: postgres:16
-    container_name: postgres-target
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_DB: targetdb
-      POSTGRES_USER: kafka_user
-      POSTGRES_PASSWORD: kafka_password
-    command: >
-      postgres
-      -c wal_level=logical
-      -c max_wal_senders=10
-      -c max_replication_slots=10
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
-
   kafka-exporter:
     image: danielqsj/kafka-exporter:latest
     container_name: kafka-exporter
@@ -165,7 +120,8 @@ services:
     ports:
       - "9308:9308"
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
 
   prometheus:
     image: prom/prometheus:latest
@@ -186,10 +142,10 @@ services:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
 
+# NOTE: No mysql or postgres services — using VPS databases
 volumes:
   kafka-data:
-  mysql-data:
-  postgres-data:
   grafana-data:
+
 
   
