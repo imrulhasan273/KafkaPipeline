@@ -262,7 +262,7 @@ Expected: `log_bin = ON` and `binlog_format = ROW`. If not, configure it:
 
 ```bash
 # AlmaLinux 9 — MySQL config path
-sudo nano /etc/my.cnf
+sudo vi /etc/my.cnf
 ```
 
 Add or update these lines under `[mysqld]`:
@@ -344,7 +344,7 @@ Test-NetConnection -ComputerName 62.171.177.208 -Port 3306
 ```bash
 # AlmaLinux 9 — PostgreSQL 17 paths
 # Data directory: /var/lib/pgsql/17/data/
-sudo nano /var/lib/pgsql/17/data/postgresql.conf
+sudo vi /var/lib/pgsql/17/data/postgresql.conf
 ```
 
 Set:
@@ -358,7 +358,7 @@ listen_addresses = '*'
 
 ```bash
 # Edit pg_hba.conf to allow remote connections
-sudo nano /var/lib/pgsql/17/data/pg_hba.conf
+sudo vi /var/lib/pgsql/17/data/pg_hba.conf
 ```
 
 Add this line (allows all users from any IP with password auth):
@@ -1655,8 +1655,8 @@ sudo -u postgres psql -d targetdb -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHE
 Edit `connectors/source/mysql-cdc-source.json` — set `table.include.list` to your actual table(s):
 
 ```json
-"database.include.list": "your_production_db",
-"table.include.list": "your_production_db.orders,your_production_db.customers"
+"database.include.list": "sourcedb",
+"table.include.list": "sourcedb.orders,sourcedb.customers"
 ```
 
 Example for this project:
@@ -2545,7 +2545,7 @@ See [connectors/source/mysql-cdc-source.json](../connectors/source/mysql-cdc-sou
 
 ```bash
 # Edit postgresql.conf
-sudo nano /var/lib/pgsql/17/data/postgresql.conf
+sudo vi /var/lib/pgsql/17/data/postgresql.conf
 ```
 
 Set:
