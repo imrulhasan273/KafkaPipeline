@@ -1,5 +1,59 @@
 # Kafka Pipeline — Complete Implementation Guide
 
+---
+
+## Fresh Start Checklist
+
+Use this before every new setup. All boxes must be checked before moving to Phase 4.
+
+### Files that must exist before `docker compose up -d`
+
+- [ ] `docker-compose.yml`
+- [ ] `scripts/mysql-init.sql`
+- [ ] `scripts/postgres-init.sql`
+- [ ] `monitoring/prometheus.yml`
+- [ ] `connectors/source/mysql-cdc-source.json`
+- [ ] `connectors/sink/postgres-sink.json`
+
+> **Why:** `docker compose up -d` mounts `monitoring/prometheus.yml` at startup. If the file is missing, Prometheus container fails. MySQL and PostgreSQL init scripts also run at first container start only — if they're missing, tables won't be created.
+
+### Connector JSON files must use Option A values for Docker setup
+
+| File | `hostname` should be | `password` should be |
+|------|---------------------|---------------------|
+| `mysql-cdc-source.json` | `"mysql"` | `"kafka_password"` |
+| `postgres-sink.json` | `"postgres"` in URL | `"kafka_password"` |
+
+> If you previously used VPS (Option B) credentials, reset them to Option A values before starting fresh with Docker.
+
+### Topics must be created BEFORE registering connectors
+
+Kafka Connect stores connector state in Kafka topics. If `_connect-configs`, `_connect-offsets`, `_connect-status` don't exist, connectors fail silently.
+
+The following topics must all exist:
+- `prod.mysql.sourcedb.orders`
+- `prod.mysql.sourcedb.customers`
+- `prod.dlq.errors`
+- `_connect-configs`
+- `_connect-offsets`
+- `_connect-status`
+- `__debezium-heartbeat.prod.mysql`
+- `prod.mysql`
+
+### Order of operations (do NOT skip steps)
+
+```
+1. docker compose up -d
+2. Wait for kafka-connect → healthy  (~2-3 min)
+3. Create all Kafka topics            (Phase 5)
+4. Register source connector          (Phase 6)
+5. Wait for snapshot to complete      (~30 sec)
+6. Register sink connector            (Phase 7)
+7. Verify data in PostgreSQL
+```
+
+---
+
 **For:** A developer starting from scratch who wants to build a production-grade MySQL → Kafka → PostgreSQL CDC pipeline.
 
 **Environments covered:** Windows 11 (PowerShell), Linux AlmaLinux 9, macOS Apple Silicon (M1/M2/M3)
