@@ -9,8 +9,8 @@ Use this before every new setup. All boxes must be checked before moving to Phas
 ### Files that must exist before `docker compose up -d`
 
 - [ ] `docker-compose.yml`
-- [ ] `scripts/mysql-init.sql`
-- [ ] `scripts/postgres-init.sql`
+- [ ] `scripts/mysql-init.sql` *(Option A — Docker only)*
+- [ ] `scripts/postgres-init.sql` *(Option A — Docker only)*
 - [ ] `monitoring/prometheus.yml`
 - [ ] `connectors/source/mysql-cdc-source.json`
 - [ ] `connectors/sink/postgres-sink.json`
@@ -516,7 +516,7 @@ Test-NetConnection -ComputerName 62.171.177.208 -Port 5432
 
 ---
 
-## Step 4.1 — Create `scripts/mysql-init.sql`
+## Step 4.1 — Create `scripts/mysql-init.sql` *(Option A — Docker only)*
 
 **Why:** When the Docker MySQL container starts for the first time, it automatically runs any `.sql` files in `/docker-entrypoint-initdb.d/`. This script creates the source tables and grants CDC permissions to `kafka_user`. Without the REPLICATION SLAVE grant, Debezium cannot read the binlog.
 
@@ -560,7 +560,7 @@ Save as: `scripts/mysql-init.sql`
 
 ---
 
-## Step 4.2 — Create `scripts/postgres-init.sql`
+## Step 4.2 — Create `scripts/postgres-init.sql` *(Option A — Docker only)*
 
 **Why:** This script runs automatically when the Docker PostgreSQL container starts. It creates the `pipeline` schema where Debezium will write synced data.
 
