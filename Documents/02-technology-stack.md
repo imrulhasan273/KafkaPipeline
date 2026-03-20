@@ -12,7 +12,7 @@
 | SQL Stream Processing | ksqlDB | 0.29+ | Confluent-maintained |
 | Sink | JDBC Sink Connector | Confluent 10.x | Handles most RDBMS |
 | Orchestration | Apache Airflow | 2.9+ | For batch workflows |
-| Containerization | Docker / Kubernetes | Docker 25+ / K8s 1.29+ | Helm charts available |
+| Containerization | Docker / Kubernetes | Docker 29+ / K8s 1.29+ | Helm charts available |
 | Monitoring | Prometheus + Grafana | Latest | JMX exporter for Kafka |
 | Log Aggregation | ELK Stack / Loki | Latest | Structured JSON logging |
 

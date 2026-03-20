@@ -16,6 +16,8 @@
 
 ### `monitoring/prometheus.yml`
 
+> **Note:** The configuration below is the full reference version with alertmanager and rule_files references — useful for production setups. For the minimal Docker setup (without alertmanager), the version in `00-implementation-plan.md` (Step 4.3) is sufficient and only includes the `kafka-exporter` and `kafka-connect` scrape targets.
+
 ```yaml
 global:
   scrape_interval: 15s
@@ -369,6 +371,8 @@ logging.getLogger().addHandler(handler)
 
 ## 6. Consumer Lag Monitoring Script
 
+> **Platform note:** `scripts/check-lag.sh` is a bash script that runs on Linux (AlmaLinux 9) and macOS only. For Windows PowerShell, use the equivalent commands directly (see below the script).
+
 ```bash
 #!/bin/bash
 # scripts/check-lag.sh
@@ -392,7 +396,28 @@ docker exec kafka kafka-consumer-groups \
     if [ "$lag" -gt "$THRESHOLD" ]; then
       echo "⚠ HIGH LAG: Group=$group Lag=$lag"
     else
-      echo "✓ OK: Group=$group Lag=$lag"
+      echo "OK: Group=$group Lag=$lag"
     fi
   done
 ```
+
+**Windows PowerShell equivalent:**
+
+```powershell
+# Check lag for the sink consumer group on Windows
+docker exec kafka kafka-consumer-groups `
+  --bootstrap-server localhost:9092 `
+  --describe `
+  --group connect-postgres-sink
+
+# List all groups and check lag for each
+$groups = docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --list
+foreach ($group in $groups) {
+    Write-Host "=== $group ==="
+    docker exec kafka kafka-consumer-groups `
+      --bootstrap-server localhost:9092 `
+      --group $group `
+      --describe
+}
+```
+

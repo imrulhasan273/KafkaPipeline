@@ -1,8 +1,27 @@
 # Data Ingestion
 
+## Why This Document Exists
+
+Data ingestion is the process of getting data from source systems into Kafka topics. This document covers all supported ingestion methods: CDC from MySQL (primary), CDC from PostgreSQL, CDC from Oracle, JDBC batch polling, and CSV file ingestion.
+
+**Critical notes that apply to ALL source connectors:**
+
+- `key.converter.schemas.enable` and `value.converter.schemas.enable` must be `"true"` — the Debezium JDBC Sink connector needs schema information embedded in each message. Setting these to `"false"` causes the sink to write 0 rows silently (no error, just nothing happens).
+- `transforms.unwrap.drop.tombstones` must be `"true"` — when MySQL deletes a row, Debezium sends 2 messages: a rewrite record and a tombstone (null value). The Debezium JDBC Sink crashes on tombstones with `primary key mode 'record_value' cannot have null schema`. Setting `drop.tombstones: true` prevents tombstones from reaching the sink.
+
+---
+
 ## 1. CDC from MySQL using Debezium
 
-### Prerequisites on MySQL
+### Why CDC from MySQL?
+
+**What CDC means:** Instead of running periodic queries (`SELECT * WHERE updated_at > last_run`), Debezium reads MySQL's binary log (binlog) in real-time. Every INSERT, UPDATE, and DELETE in MySQL is captured as an event and published to Kafka within milliseconds. This is how banking systems, e-commerce platforms, and analytics pipelines work at scale.
+
+**What happens:** Debezium registers as a MySQL replica, reads the binlog, and publishes structured JSON events to Kafka topics. On first start it takes a full snapshot of existing rows, then streams new changes indefinitely.
+
+### Prerequisites on MySQL (Option B — VPS)
+
+> Skip this section if using Option A (Docker MySQL) — binlog is pre-configured via the `--log-bin` command in docker-compose.
 
 ```sql
 -- Check binlog is enabled
@@ -10,13 +29,14 @@ SHOW VARIABLES LIKE 'log_bin';          -- should be ON
 SHOW VARIABLES LIKE 'binlog_format';    -- should be ROW
 SHOW VARIABLES LIKE 'binlog_row_image'; -- should be FULL
 
--- Create dedicated replication user
-CREATE USER 'debezium'@'%' IDENTIFIED WITH mysql_native_password BY 'dbz_password';
-GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'debezium'@'%';
-FLUSH PRIVILEGES;
+-- Verify kafka_user has CDC permissions
+SHOW GRANTS FOR 'kafka_user'@'%';
+-- Should include: REPLICATION SLAVE, REPLICATION CLIENT
 ```
 
 ### `connectors/source/mysql-cdc-source.json`
+
+#### Option A — Docker MySQL
 
 ```json
 {
@@ -27,14 +47,14 @@ FLUSH PRIVILEGES;
 
     "database.hostname": "mysql",
     "database.port": "3306",
-    "database.user": "debezium",
-    "database.password": "dbz_password",
+    "database.user": "kafka_user",
+    "database.password": "kafka_password",
     "database.server.id": "184054",
     "database.server.name": "prod.mysql",
 
     "topic.prefix": "prod.mysql",
     "database.include.list": "sourcedb",
-    "table.include.list": "sourcedb.orders,sourcedb.customers,sourcedb.products",
+    "table.include.list": "sourcedb.orders,sourcedb.customers",
 
     "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
     "schema.history.internal.kafka.topic": "_schema-changes.mysql",
@@ -44,15 +64,15 @@ FLUSH PRIVILEGES;
     "snapshot.locking.mode": "minimal",
 
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable: "false"
+    "key.converter.schemas.enable": "true",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable: "false"
+    "value.converter.schemas.enable": "true",
 
     "transforms": "unwrap,addMetadata",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
     "transforms.unwrap.add.fields": "op,ts_ms,source.db,source.table",
     "transforms.unwrap.delete.handling.mode": "rewrite",
-    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.unwrap.drop.tombstones": "true",
 
     "transforms.addMetadata.type": "org.apache.kafka.connect.transforms.InsertField$Value",
     "transforms.addMetadata.static.field": "_pipeline_version",
@@ -71,28 +91,141 @@ FLUSH PRIVILEGES;
 }
 ```
 
-### Deploy connector
+#### Option B — VPS MySQL
+
+Change only `database.hostname` and `database.password`:
+
+```json
+{
+  "name": "mysql-cdc-source",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "62.171.177.208",
+    "database.port": "3306",
+    "database.user": "kafka_user",
+    "database.password": "YOUR_VPS_PASSWORD",
+    "database.server.id": "184054",
+    "database.server.name": "prod.mysql",
+
+    "topic.prefix": "prod.mysql",
+    "database.include.list": "sourcedb",
+    "table.include.list": "sourcedb.orders,sourcedb.customers",
+
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "_schema-changes.mysql",
+
+    "include.schema.changes": "true",
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "minimal",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true",
+
+    "transforms": "unwrap,addMetadata",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.add.fields": "op,ts_ms,source.db,source.table",
+    "transforms.unwrap.delete.handling.mode": "rewrite",
+    "transforms.unwrap.drop.tombstones": "true",
+
+    "transforms.addMetadata.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.addMetadata.static.field": "_pipeline_version",
+    "transforms.addMetadata.static.value": "1.0",
+
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true",
+    "errors.deadletterqueue.topic.name": "prod.dlq.errors",
+    "errors.deadletterqueue.topic.replication.factor": "1",
+
+    "heartbeat.interval.ms": "10000",
+    "max.batch.size": "2048",
+    "max.queue.size": "8192"
+  }
+}
+```
+
+| Field | Option A (Docker) | Option B (VPS) |
+|-------|------------------|----------------|
+| `database.hostname` | `"mysql"` | `"YOUR_VPS_IP"` (e.g. `"62.171.177.208"`) |
+| `database.password` | `"kafka_password"` | `"YOUR_VPS_PASSWORD"` |
+
+### Key config settings explained
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `key.converter.schemas.enable` | `"true"` | **CRITICAL** — Sink needs schema info embedded in messages. `false` = sink writes 0 rows silently. |
+| `value.converter.schemas.enable` | `"true"` | Same as above — both key and value schemas must be included. |
+| `transforms.unwrap.drop.tombstones` | `"true"` | **CRITICAL** — Prevents null schema crash on deletes. |
+| `transforms.unwrap.delete.handling.mode` | `"rewrite"` | Converts DELETE events to UPDATE with `__deleted: true` (soft delete / audit trail). |
+| `snapshot.mode` | `"initial"` | Full snapshot on first start, then streams. Skip on subsequent restarts if offsets exist. |
+| `database.server.id` | `"184054"` | Unique ID Debezium uses to register as a MySQL replica. Any unused number works. |
+
+### Deploy the connector
+
+**Linux (AlmaLinux 9) / macOS (M1/M2/M3):**
 
 ```bash
-# Register the connector
 curl -X POST http://localhost:8083/connectors \
   -H "Content-Type: application/json" \
   -d @connectors/source/mysql-cdc-source.json
-
-# Check status
-curl http://localhost:8083/connectors/mysql-cdc-source/status | python3 -m json.tool
-
-# Expected output:
-# {
-#   "name": "mysql-cdc-source",
-#   "connector": { "state": "RUNNING", "worker_id": "..." },
-#   "tasks": [{ "id": 0, "state": "RUNNING", "worker_id": "..." }]
-# }
 ```
+
+**Windows PowerShell:**
+
+```powershell
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/source/mysql-cdc-source.json"
+```
+
+Alternative (native PowerShell, no curl.exe needed):
+
+```powershell
+$body = Get-Content connectors/source/mysql-cdc-source.json -Raw
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8083/connectors" `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+### Check connector status
+
+**Linux (AlmaLinux 9) / macOS (M1/M2/M3):**
+
+```bash
+curl http://localhost:8083/connectors/mysql-cdc-source/status | python3 -m json.tool
+```
+
+**Windows PowerShell:**
+
+```powershell
+curl.exe http://localhost:8083/connectors/mysql-cdc-source/status
+```
+
+Expected output:
+
+```json
+{
+  "name": "mysql-cdc-source",
+  "connector": { "state": "RUNNING", "worker_id": "kafka-connect:8083" },
+  "tasks": [{ "id": 0, "state": "RUNNING", "worker_id": "kafka-connect:8083" }],
+  "type": "source"
+}
+```
+
+Both `connector.state` and `tasks[0].state` must be `RUNNING`.
 
 ---
 
 ## 2. CDC from PostgreSQL using Debezium
+
+### Why CDC from PostgreSQL?
+
+PostgreSQL uses WAL (Write-Ahead Log) for CDC. Debezium uses the `pgoutput` plugin (built into PostgreSQL 10+) to stream WAL changes. No additional plugins need to be installed.
 
 ### Prerequisites on PostgreSQL
 
@@ -101,14 +234,25 @@ curl http://localhost:8083/connectors/mysql-cdc-source/status | python3 -m json.
 SHOW wal_level;   -- should be 'logical'
 
 -- Create replication user
-CREATE USER debezium WITH REPLICATION LOGIN PASSWORD 'dbz_password';
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium;
+CREATE USER kafka_user WITH REPLICATION LOGIN PASSWORD 'kafka_password';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO kafka_user;
 
 -- Create publication (Debezium uses pgoutput plugin)
 CREATE PUBLICATION dbz_publication FOR TABLE public.orders, public.customers;
 
 -- Verify
 SELECT * FROM pg_publication;
+```
+
+Heartbeat table (prevents WAL slot from falling behind):
+
+```sql
+-- Run on source PostgreSQL
+CREATE TABLE IF NOT EXISTS public.debezium_heartbeat (
+    id INT PRIMARY KEY DEFAULT 1,
+    ts TIMESTAMPTZ
+);
+INSERT INTO public.debezium_heartbeat VALUES (1, now());
 ```
 
 ### `connectors/source/postgres-cdc-source.json`
@@ -122,8 +266,8 @@ SELECT * FROM pg_publication;
 
     "database.hostname": "postgres-source",
     "database.port": "5432",
-    "database.user": "debezium",
-    "database.password": "dbz_password",
+    "database.user": "kafka_user",
+    "database.password": "kafka_password",
     "database.dbname": "sourcedb",
 
     "topic.prefix": "prod.postgres",
@@ -138,14 +282,15 @@ SELECT * FROM pg_publication;
     "snapshot.isolation.mode": "read_committed",
 
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable: "false"
+    "key.converter.schemas.enable": "true",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable: "false"
+    "value.converter.schemas.enable": "true",
 
     "transforms": "unwrap",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
     "transforms.unwrap.add.fields": "op,ts_ms",
     "transforms.unwrap.delete.handling.mode": "rewrite",
+    "transforms.unwrap.drop.tombstones": "true",
 
     "errors.tolerance": "all",
     "errors.deadletterqueue.topic.name": "prod.dlq.errors",
@@ -156,20 +301,31 @@ SELECT * FROM pg_publication;
 }
 ```
 
-### Heartbeat table (prevents WAL slot from falling behind)
+### Deploy the connector
 
-```sql
--- Run on source PostgreSQL
-CREATE TABLE IF NOT EXISTS public.debezium_heartbeat (
-    id INT PRIMARY KEY DEFAULT 1,
-    ts TIMESTAMPTZ
-);
-INSERT INTO public.debezium_heartbeat VALUES (1, now());
+**Linux (AlmaLinux 9) / macOS (M1/M2/M3):**
+
+```bash
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connectors/source/postgres-cdc-source.json
+```
+
+**Windows PowerShell:**
+
+```powershell
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/source/postgres-cdc-source.json"
 ```
 
 ---
 
 ## 3. CDC from Oracle using Debezium (LogMiner)
+
+### Why Oracle CDC?
+
+Oracle uses LogMiner to read archived redo logs. This approach captures all DML changes (INSERT/UPDATE/DELETE) without requiring application changes. It requires Oracle 11g+ and specific user grants.
 
 ### Prerequisites on Oracle
 
@@ -217,22 +373,45 @@ GRANT LOGMINING TO c##debezium CONTAINER=ALL;
     "snapshot.mode": "initial",
 
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable: "false"
+    "key.converter.schemas.enable": "true",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable: "false"
+    "value.converter.schemas.enable": "true",
 
     "transforms": "unwrap",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
-    "transforms.unwrap.add.fields": "op,ts_ms"
+    "transforms.unwrap.add.fields": "op,ts_ms",
+    "transforms.unwrap.drop.tombstones": "true"
   }
 }
+```
+
+### Deploy the connector
+
+**Linux (AlmaLinux 9) / macOS (M1/M2/M3):**
+
+```bash
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connectors/source/oracle-cdc-source.json
+```
+
+**Windows PowerShell:**
+
+```powershell
+curl.exe -X POST http://localhost:8083/connectors `
+  -H "Content-Type: application/json" `
+  -d "@connectors/source/oracle-cdc-source.json"
 ```
 
 ---
 
 ## 4. JDBC Source Connector (Batch / Polling)
 
-For databases without CDC capability or for scheduled batch loads.
+### Why JDBC batch?
+
+For databases without CDC capability (no binlog, no WAL access), or when you only need scheduled batch loads and sub-second latency is not required. JDBC polling runs periodic `SELECT` queries using an incrementing column and/or timestamp column to detect new/changed rows.
+
+**Limitation:** JDBC batch cannot detect DELETEs — only INSERTs and UPDATEs (via timestamp column). Use CDC for full change capture.
 
 ### `connectors/source/jdbc-batch-source.json`
 
@@ -259,16 +438,18 @@ For databases without CDC capability or for scheduled batch loads.
     "timestamp.delay.interval.ms": "1000",
 
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable: "false"
+    "value.converter.schemas.enable": "true"
   }
 }
 ```
 
 ---
 
-## 5. File Ingestion (CSV → Kafka)
+## 5. File Ingestion (CSV to Kafka)
 
 ### Option A: SpoolDir Connector (recommended for structured files)
+
+**Why:** The SpoolDir connector watches a directory for new CSV files and produces each row as a Kafka message. Files are moved to a "processed" directory after ingestion.
 
 ```json
 {
@@ -289,7 +470,7 @@ For databases without CDC capability or for scheduled batch loads.
 
     "key.converter": "org.apache.kafka.connect.storage.StringConverter",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable: "false"
+    "value.converter.schemas.enable": "true",
 
     "schema.generation.enabled": "true",
     "schema.generation.key.fields": "id",
@@ -301,6 +482,10 @@ For databases without CDC capability or for scheduled batch loads.
 ```
 
 ### Option B: Custom Python Producer for CSV
+
+**Why:** Use when you need custom parsing logic, field transformations, or the SpoolDir connector is not available in your Kafka Connect image.
+
+**What happens:** The script reads a CSV file row by row, serializes each row as Avro (with schema registered in Schema Registry), and produces it to Kafka. Progress is logged every 1000 rows.
 
 ```python
 # scripts/csv_producer.py
@@ -369,9 +554,18 @@ if __name__ == "__main__":
     produce_csv(sys.argv[1])
 ```
 
+Run (Python 3.13, venv activated):
+
+**Linux (AlmaLinux 9) / macOS (M1/M2/M3):**
+
 ```bash
-# Usage
 python scripts/csv_producer.py /data/input/orders_2024.csv
+```
+
+**Windows PowerShell:**
+
+```powershell
+python scripts\csv_producer.py C:\data\input\orders_2024.csv
 ```
 
 ---
@@ -392,6 +586,8 @@ python scripts/csv_producer.py /data/input/orders_2024.csv
 ## 7. Debezium Event Structure Reference
 
 ### Full CDC Event (before `unwrap` transform)
+
+**What:** The raw Debezium message contains both the before and after state of the row, plus rich metadata about the source system.
 
 ```json
 {
@@ -424,6 +620,8 @@ python scripts/csv_producer.py /data/input/orders_2024.csv
 
 ### After `ExtractNewRecordState` (unwrap) transform
 
+**What:** The `unwrap` transform flattens the nested payload to a simple flat record. The `after` fields become top-level fields and CDC metadata is added as `__` prefixed fields.
+
 ```json
 {
   "id": 1,
@@ -436,3 +634,85 @@ python scripts/csv_producer.py /data/input/orders_2024.csv
   "__source_table": "orders"
 }
 ```
+
+**Operation codes:**
+- `c` = create (INSERT)
+- `u` = update (UPDATE)
+- `d` = delete (DELETE)
+- `r` = read (snapshot row)
+
+---
+
+## 8. Connector Management REST API
+
+All connector management uses the Kafka Connect REST API at `http://localhost:8083`.
+
+### List, status, delete
+
+**Linux (AlmaLinux 9) / macOS (M1/M2/M3):**
+
+```bash
+# List all connectors
+curl http://localhost:8083/connectors
+
+# Check status
+curl http://localhost:8083/connectors/mysql-cdc-source/status | python3 -m json.tool
+
+# Delete a connector
+curl -X DELETE http://localhost:8083/connectors/mysql-cdc-source
+
+# Restart a connector
+curl -X POST http://localhost:8083/connectors/mysql-cdc-source/restart
+
+# Pause a connector
+curl -X PUT http://localhost:8083/connectors/mysql-cdc-source/pause
+
+# Resume a connector
+curl -X PUT http://localhost:8083/connectors/mysql-cdc-source/resume
+```
+
+**Windows PowerShell:**
+
+```powershell
+# List all connectors
+curl.exe http://localhost:8083/connectors
+
+# Check status
+curl.exe http://localhost:8083/connectors/mysql-cdc-source/status
+
+# Delete a connector
+curl.exe -X DELETE http://localhost:8083/connectors/mysql-cdc-source
+
+# Restart a connector
+curl.exe -X POST http://localhost:8083/connectors/mysql-cdc-source/restart
+
+# Pause a connector
+curl.exe -X PUT http://localhost:8083/connectors/mysql-cdc-source/pause
+
+# Resume a connector
+curl.exe -X PUT http://localhost:8083/connectors/mysql-cdc-source/resume
+```
+
+---
+
+## Common Errors
+
+**Error: Connector state is FAILED — `Access denied for user 'kafka_user'@'%' to database 'sourcedb'`**
+- The user doesn't have the required privileges.
+- Fix: Grant `REPLICATION SLAVE, REPLICATION CLIENT` (and `SELECT` on the database) in MySQL.
+
+**Error: Messages in Kafka have no schema (just raw values, not `{"schema":..., "payload":...}`)**
+- Cause: `schemas.enable` is `false` somewhere.
+- Fix: Ensure both `key.converter.schemas.enable: "true"` and `value.converter.schemas.enable: "true"` are set. After fixing, delete the connector + topics + recreate (old schemaless messages must be cleared).
+
+**Error: Sink connector task FAILED with `cannot have null schema`**
+- Cause: A tombstone message (null value, null key schema) reached the sink.
+- Fix: Set `transforms.unwrap.drop.tombstones: "true"` in the source connector config.
+
+**Error: `Connector mysql-cdc-source already exists` (error_code: 409)**
+- The connector is already registered. This is normal — connector configs are stored in Kafka's `_connect-configs` topic and survive restarts.
+- If you want to update the config, delete it first: `curl -X DELETE http://localhost:8083/connectors/mysql-cdc-source`
+
+**Snapshot skips existing data on re-registration**
+- `snapshot.mode: initial` only snapshots if NO stored offsets exist for this connector name.
+- Fix: Delete and re-register with a new connector name, or trigger real MySQL UPDATEs to force CDC events.

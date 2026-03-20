@@ -24,6 +24,8 @@
 
 ### Generate Certificates (Development)
 
+> **Platform note:** `scripts/generate-certs.sh` is a bash script that requires `openssl` and `keytool`. Run it on Linux (AlmaLinux 9) or macOS directly. On Windows, use WSL (Windows Subsystem for Linux) or Git Bash with OpenJDK installed.
+
 ```bash
 #!/bin/bash
 # scripts/generate-certs.sh
@@ -225,6 +227,8 @@ ssl.truststore.password=changeme123
 ---
 
 ## 3. Authorization (ACLs)
+
+> **Platform note:** `docker exec kafka kafka-acls` commands run inside the Kafka container and work identically on Windows PowerShell, Linux (AlmaLinux 9), and macOS. No platform-specific variants needed.
 
 ### Grant topic-level ACLs
 

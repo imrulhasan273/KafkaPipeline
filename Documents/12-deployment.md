@@ -4,24 +4,51 @@
 
 See [03-environment-setup.md](03-environment-setup.md) for the full `docker-compose.yml`.
 
+> **Why `docker compose` (not `docker-compose`):** The `docker-compose` command (with a hyphen) is the old standalone CLI v1. Docker 29.x ships `docker compose` (subcommand, no hyphen) as the v2 plugin. Use `docker compose` for all new projects.
+
 ### Quick start commands
+
+All `docker compose` commands work identically on Windows PowerShell, Linux (AlmaLinux 9), and macOS (M1/M2/M3):
 
 ```bash
 # Start all services
-docker-compose up -d
+docker compose up -d
 
 # Start specific services
-docker-compose up -d kafka schema-registry kafka-connect
+docker compose up -d kafka schema-registry kafka-connect
 
 # View logs
-docker-compose logs -f kafka-connect
+docker compose logs -f kafka-connect
 
 # Scale Connect workers
-docker-compose up -d --scale kafka-connect=3
+docker compose up -d --scale kafka-connect=3
 
 # Stop and clean up
-docker-compose down -v   # -v removes volumes (data loss!)
-docker-compose down      # Keep volumes
+docker compose down -v   # -v removes volumes (data loss!)
+docker compose down      # Keep volumes
+```
+
+**Windows PowerShell — additional tips:**
+
+```powershell
+# Open Kafka UI in browser
+Start-Process "http://localhost:8090"
+
+# Check service health
+docker compose ps
+
+# Restart a specific service
+docker compose restart kafka-connect
+```
+
+**Linux (AlmaLinux 9) / macOS (M1/M2/M3):**
+
+```bash
+# Watch service status
+watch -n 2 docker compose ps
+
+# Follow logs for multiple services
+docker compose logs -f kafka kafka-connect
 ```
 
 ---
@@ -355,6 +382,8 @@ jobs:
 ```
 
 ### `scripts/deploy-connectors.sh`
+
+> **Platform note:** This is a bash script that runs on Linux agents and macOS. CI/CD pipelines (GitHub Actions `ubuntu-latest`) run on Linux, so this script works as-is. For local development on Windows, use Git Bash or WSL to run bash scripts.
 
 ```bash
 #!/bin/bash

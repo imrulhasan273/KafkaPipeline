@@ -166,6 +166,10 @@ Each topic has two subjects by default:
 
 ## Schema Registry REST API
 
+> **Platform note:** On Windows PowerShell, use `curl.exe` instead of `curl`. In PowerShell, `curl` is an alias for `Invoke-WebRequest`. On Linux (AlmaLinux 9) and macOS, `curl` works as-is.
+
+**Linux (AlmaLinux 9) / macOS (M1/M2/M3):**
+
 ```bash
 # List all subjects
 curl http://localhost:8081/subjects
@@ -204,6 +208,38 @@ curl -X DELETE http://localhost:8081/subjects/prod.mysql.sourcedb.orders-value/v
 
 # Delete all versions (soft delete)
 curl -X DELETE http://localhost:8081/subjects/prod.mysql.sourcedb.orders-value
+```
+
+**Windows PowerShell:**
+
+```powershell
+# List all subjects
+curl.exe http://localhost:8081/subjects
+
+# Get all versions of a subject
+curl.exe http://localhost:8081/subjects/prod.mysql.sourcedb.orders-value/versions
+
+# Get a specific version
+curl.exe http://localhost:8081/subjects/prod.mysql.sourcedb.orders-value/versions/1
+
+# Get the latest version
+curl.exe http://localhost:8081/subjects/prod.mysql.sourcedb.orders-value/versions/latest
+
+# Set compatibility level for a subject
+curl.exe -X PUT http://localhost:8081/config/prod.mysql.sourcedb.orders-value `
+  -H "Content-Type: application/vnd.schemaregistry.v1+json" `
+  -d '{"compatibility": "BACKWARD"}'
+
+# Set global compatibility level
+curl.exe -X PUT http://localhost:8081/config `
+  -H "Content-Type: application/vnd.schemaregistry.v1+json" `
+  -d '{"compatibility": "BACKWARD"}'
+
+# Delete a schema version (soft delete)
+curl.exe -X DELETE http://localhost:8081/subjects/prod.mysql.sourcedb.orders-value/versions/1
+
+# Delete all versions (soft delete)
+curl.exe -X DELETE http://localhost:8081/subjects/prod.mysql.sourcedb.orders-value
 ```
 
 ---

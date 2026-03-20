@@ -156,6 +156,8 @@ __connect.errors.exception.stacktrace  = ...
 
 ### DLQ Consumer / Reprocessor
 
+> **Platform note:** Python scripts are platform-agnostic. Run with `python scripts/dlq_reprocessor.py` on all platforms (Windows PowerShell, Linux, macOS) with venv activated.
+
 ```python
 # scripts/dlq_reprocessor.py
 """
@@ -247,6 +249,8 @@ props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_
 ---
 
 ## Offset Management
+
+> **Platform note:** All `docker exec kafka kafka-consumer-groups` commands run inside the Kafka container and work identically on Windows PowerShell, Linux (AlmaLinux 9), and macOS. No platform-specific variants are needed.
 
 ### Reset consumer group offsets (use with caution)
 

@@ -228,14 +228,15 @@ export KAFKA_JVM_PERFORMANCE_OPTS="
 Use log compaction when you only need the latest value per key (like a database table).
 
 ```bash
+# Compact after 1 day (segment.ms=86400000), keep tombstones for 1 day
 docker exec kafka kafka-topics \
   --bootstrap-server localhost:9092 \
   --alter \
   --topic prod.mysql.sourcedb.customers \
   --config cleanup.policy=compact \
   --config min.cleanable.dirty.ratio=0.1 \
-  --config segment.ms=86400000 \       # Compact after 1 day
-  --config delete.retention.ms=86400000  # Keep tombstones for 1 day
+  --config segment.ms=86400000 \
+  --config delete.retention.ms=86400000
 ```
 
 With compaction + `ExtractNewRecordState` (delete handling = tombstone):
